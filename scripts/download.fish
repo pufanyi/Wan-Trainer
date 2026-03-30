@@ -1,0 +1,1 @@
+hf download Wan-AI/Wan2.2-I2V-A14B --local-dir storage/models/Wan2.2-I2V-A14B
