@@ -5,16 +5,20 @@ components from the WanImageToVideoPipeline.
 """
 
 import html
+import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 import ftfy
 import regex as re
 import torch
 import torch.nn.functional as F
-from diffusers import AutoencoderKLWan, WanImageToVideoPipeline
+from diffusers import AutoencoderKLWan
 from diffusers.models import WanTransformer3DModel
+from loguru import logger
 from peft import LoraConfig
 from pydantic import BaseModel
-from transformers import UMT5EncoderModel
+from transformers import AutoTokenizer, UMT5EncoderModel
 
 
 class LoRATrainConfig(BaseModel):
@@ -54,11 +58,53 @@ class WanI2VForTraining:
         self.train_experts = train_experts
         self.train_text_encoder = train_text_encoder
 
-        pipe = WanImageToVideoPipeline.from_pretrained(model_path, torch_dtype=torch.bfloat16)
+        model_dir = Path(model_path)
+
+        # ---- Read pipeline config for boundary_ratio ----
+        with open(model_dir / "model_index.json") as f:
+            pipe_config = json.load(f)
+        self.num_train_timesteps = 1000
+        boundary_ratio = pipe_config.get("boundary_ratio", 0.9)
+        self.boundary_timestep = int(boundary_ratio * self.num_train_timesteps)  # 900
+
+        # ---- Load components in parallel ----
+        def _load_tokenizer():
+            return AutoTokenizer.from_pretrained(model_dir / "tokenizer")
+
+        def _load_text_encoder():
+            return UMT5EncoderModel.from_pretrained(
+                model_dir / "text_encoder", torch_dtype=torch.bfloat16
+            )
+
+        def _load_vae():
+            return AutoencoderKLWan.from_pretrained(
+                model_dir / "vae", torch_dtype=torch.bfloat16
+            )
+
+        def _load_transformer(subfolder: str):
+            return WanTransformer3DModel.from_pretrained(
+                model_dir / subfolder, torch_dtype=torch.bfloat16
+            )
+
+        futures = {}
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures["tokenizer"] = pool.submit(_load_tokenizer)
+            futures["text_encoder"] = pool.submit(_load_text_encoder)
+            futures["vae"] = pool.submit(_load_vae)
+            if train_experts in ("both", "high"):
+                futures["transformer"] = pool.submit(_load_transformer, "transformer")
+            if train_experts in ("both", "low"):
+                futures["transformer_2"] = pool.submit(_load_transformer, "transformer_2")
+
+            for fut in as_completed(futures.values()):
+                name = next(k for k, v in futures.items() if v is fut)
+                fut.result()  # raise on error
+                logger.info("Loaded {}", name)
+
+        self.tokenizer = futures["tokenizer"].result()
 
         # ---- Text encoder ----
-        self.tokenizer = pipe.tokenizer
-        self.text_encoder: UMT5EncoderModel = pipe.text_encoder
+        self.text_encoder: UMT5EncoderModel = futures["text_encoder"].result()
         if train_text_encoder:
             self.text_encoder.train()
             self.text_encoder.gradient_checkpointing_enable()
@@ -67,18 +113,17 @@ class WanI2VForTraining:
             self.text_encoder.eval()
 
         # ---- VAE (always frozen) ----
-        self.vae: AutoencoderKLWan = pipe.vae
+        self.vae: AutoencoderKLWan = futures["vae"].result()
         self.vae.requires_grad_(False)
         self.vae.eval()
 
         # ---- Transformers (only load what we need) ----
-        self.transformer: WanTransformer3DModel | None = None
-        self.transformer_2: WanTransformer3DModel | None = None
-
-        if train_experts in ("both", "high"):
-            self.transformer = pipe.transformer
-        if train_experts in ("both", "low"):
-            self.transformer_2 = pipe.transformer_2
+        self.transformer: WanTransformer3DModel | None = futures.get("transformer", None)
+        if self.transformer is not None:
+            self.transformer = self.transformer.result()
+        self.transformer_2: WanTransformer3DModel | None = futures.get("transformer_2", None)
+        if self.transformer_2 is not None:
+            self.transformer_2 = self.transformer_2.result()
 
         # ---- LoRA or full fine-tuning ----
         self.lora_config = lora_config
@@ -114,13 +159,6 @@ class WanI2VForTraining:
         # ---- Scale factors (from VAE config, not hardcoded) ----
         self.vae_scale_factor_spatial: int = vae_cfg.scale_factor_spatial
         self.vae_scale_factor_temporal: int = vae_cfg.scale_factor_temporal
-
-        # ---- MoE config ----
-        self.num_train_timesteps = 1000
-        boundary_ratio = pipe.config.boundary_ratio
-        self.boundary_timestep = int(boundary_ratio * self.num_train_timesteps)  # 900
-
-        del pipe
 
     def trainable_parameters(self) -> list[torch.nn.Parameter]:
         """Return a list (not generator) of all trainable parameters."""
