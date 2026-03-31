@@ -16,6 +16,7 @@ from src.data.i2v_dataset import I2VDataset
 from src.models.wan_i2v import LoRATrainConfig, WanI2VForTraining
 from src.trainer.checkpoint import TrainState
 from src.trainer.config import TrainConfig
+from src.trainer.flops import MFUMonitor, compute_wan_seq_len, estimate_wan_forward_flops, get_gpu_peak_flops_bf16
 
 logger = logging.getLogger(__name__)
 
@@ -183,9 +184,54 @@ class I2VTrainer:
             optimizer_2=self.optimizer_2,
         )
 
+        # ---- MFU monitor ----
+        self.mfu_monitor = self._setup_mfu()
+
         # ---- Resume ----
         if cfg.resume_from:
             self._load_checkpoint(cfg.resume_from)
+
+    # ------------------------------------------------------------------
+    # MFU setup
+    # ------------------------------------------------------------------
+
+    def _setup_mfu(self) -> MFUMonitor | None:
+        """Pre-compute FLOPs and create MFU monitor. Returns None if GPU is unrecognized."""
+        gpu_peak = get_gpu_peak_flops_bf16()
+        if gpu_peak is None:
+            return None
+
+        t = self.model.transformer or self.model.transformer_2
+        t_cfg = t.config
+
+        seq_len = compute_wan_seq_len(
+            self.cfg.num_frames,
+            self.cfg.height,
+            self.cfg.width,
+            patch_size=tuple(t_cfg.patch_size),
+            vae_temporal_factor=self.model.vae_scale_factor_temporal,
+            vae_spatial_factor=self.model.vae_scale_factor_spatial,
+        )
+        forward_flops = estimate_wan_forward_flops(
+            num_layers=t_cfg.num_layers,
+            num_heads=t_cfg.num_attention_heads,
+            head_dim=t_cfg.attention_head_dim,
+            ffn_dim=t_cfg.ffn_dim,
+            seq_len=seq_len,
+        )
+        # Training = forward(1x) + backward(2x) per sample, times micro-batches per optimizer step
+        flops_per_step = 3 * forward_flops * self.cfg.batch_size * self.cfg.gradient_accumulation_steps
+
+        if self.rank == 0:
+            logger.info(
+                "MFU monitor: seq_len=%d, forward=%.2e FLOPs/sample, step=%.2e FLOPs, GPU=%s (%.0f TFLOPS bf16)",
+                seq_len,
+                forward_flops,
+                flops_per_step,
+                torch.cuda.get_device_name(0),
+                gpu_peak / 1e12,
+            )
+        return MFUMonitor(flops_per_step, gpu_peak)
 
     # ------------------------------------------------------------------
     # Training loop
@@ -228,15 +274,20 @@ class I2VTrainer:
                         opt.step()
                         opt.zero_grad()
                     global_step += 1
+                    if self.mfu_monitor is not None:
+                        self.mfu_monitor.step()
 
                     if self.rank == 0 and global_step % cfg.log_steps == 0:
+                        mfu = self.mfu_monitor.flush() if self.mfu_monitor is not None else None
+                        mfu_str = f" mfu={mfu:.1%}" if mfu is not None else ""
                         logger.info(
-                            "epoch=%d step=%d/%d loss=%.4f lr=%.2e",
+                            "epoch=%d step=%d/%d loss=%.4f lr=%.2e%s",
                             epoch,
                             global_step,
                             self.total_steps,
                             loss.item(),
                             lr,
+                            mfu_str,
                         )
 
                     if cfg.save_steps > 0 and global_step % cfg.save_steps == 0:
