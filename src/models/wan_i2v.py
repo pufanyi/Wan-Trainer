@@ -50,6 +50,7 @@ class WanI2VForTraining:
         lora_config: LoRATrainConfig | None = None,
         train_experts: str = "both",
         train_text_encoder: bool = False,
+        gradient_checkpointing: bool = True,
     ):
         assert train_experts in ("both", "high", "low"), (
             f"train_experts must be 'both', 'high', or 'low', got '{train_experts}'"
@@ -65,6 +66,7 @@ class WanI2VForTraining:
         self.num_train_timesteps = 1000
         boundary_ratio = pipe_config.get("boundary_ratio", 0.9)
         self.boundary_timestep = int(boundary_ratio * self.num_train_timesteps)  # 900
+        self.boundary_idx = int((1.0 - self.boundary_timestep / self.num_train_timesteps) * self.num_train_timesteps)
 
         # ---- Load components sequentially ----
         self.tokenizer = AutoTokenizer.from_pretrained(model_dir / "tokenizer")
@@ -77,15 +79,14 @@ class WanI2VForTraining:
         logger.info("Loaded text_encoder")
         if train_text_encoder:
             self.text_encoder.train()
-            self.text_encoder.gradient_checkpointing_enable()
+            if gradient_checkpointing:
+                self.text_encoder.gradient_checkpointing_enable()
         else:
             self.text_encoder.requires_grad_(False)
             self.text_encoder.eval()
 
         # ---- VAE (always frozen) ----
-        self.vae: AutoencoderKLWan = AutoencoderKLWan.from_pretrained(
-            model_dir / "vae", torch_dtype=torch.bfloat16
-        )
+        self.vae: AutoencoderKLWan = AutoencoderKLWan.from_pretrained(model_dir / "vae", torch_dtype=torch.bfloat16)
         logger.info("Loaded vae")
         self.vae.requires_grad_(False)
         self.vae.eval()
@@ -128,7 +129,8 @@ class WanI2VForTraining:
             # Ensure uniform dtype for FSDP2 (some params load as float32)
             m.to(torch.bfloat16)
             m.train()
-            m.enable_gradient_checkpointing()
+            if gradient_checkpointing:
+                m.enable_gradient_checkpointing()
 
         # ---- VAE normalization constants ----
         vae_cfg = self.vae.config
@@ -150,6 +152,9 @@ class WanI2VForTraining:
         bsmntw = torch.exp(-2.0 * ((self.shifted_timesteps - 500.0) / 1000.0) ** 2)
         bsmntw = bsmntw - bsmntw.min()
         self.bsmntw = bsmntw * (self.num_train_timesteps / bsmntw.sum())
+        self._latent_stat_cache: dict[tuple[str, str], tuple[torch.Tensor, torch.Tensor]] = {}
+        self._training_buffer_cache: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self._condition_mask_cache: dict[tuple[str, int, int, int, torch.dtype], torch.Tensor] = {}
 
     def trainable_parameters(self) -> list[torch.nn.Parameter]:
         """Return a list (not generator) of all trainable parameters."""
@@ -172,6 +177,52 @@ class WanI2VForTraining:
         if self.transformer_2 is not None:
             self.transformer_2.save_pretrained(out / "transformer_2")
 
+    def _get_latent_stats(self, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (str(device), str(dtype))
+        cached = self._latent_stat_cache.get(key)
+        if cached is None:
+            cached = (
+                self.latents_mean.to(device=device, dtype=dtype),
+                self.latents_std_inv.to(device=device, dtype=dtype),
+            )
+            self._latent_stat_cache[key] = cached
+        return cached
+
+    def _get_training_buffers(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        key = str(device)
+        cached = self._training_buffer_cache.get(key)
+        if cached is None:
+            cached = (
+                self.shifted_sigmas.to(device=device),
+                self.shifted_timesteps.to(device=device),
+                self.bsmntw.to(device=device),
+            )
+            self._training_buffer_cache[key] = cached
+        return cached
+
+    def _get_condition_mask_template(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+        num_frames: int,
+        height: int,
+        width: int,
+    ) -> torch.Tensor:
+        key = (str(device), num_frames, height, width, dtype)
+        cached = self._condition_mask_cache.get(key)
+        if cached is not None:
+            return cached
+
+        latent_h = height // self.vae_scale_factor_spatial
+        latent_w = width // self.vae_scale_factor_spatial
+        mask = torch.ones(1, 1, num_frames, latent_h, latent_w, device=device, dtype=dtype)
+        mask[:, :, 1:] = 0
+        first_frame_mask = mask[:, :, 0:1].repeat(1, 1, self.vae_scale_factor_temporal, 1, 1)
+        mask = torch.cat([first_frame_mask, mask[:, :, 1:]], dim=2)
+        cached = mask.view(1, -1, self.vae_scale_factor_temporal, latent_h, latent_w).transpose(1, 2).contiguous()
+        self._condition_mask_cache[key] = cached
+        return cached
+
     # ------------------------------------------------------------------
     # Encoding helpers (all run under torch.no_grad)
     # ------------------------------------------------------------------
@@ -192,16 +243,10 @@ class WanI2VForTraining:
         )
         input_ids = tokens.input_ids.to(device)
         mask = tokens.attention_mask.to(device)
-        seq_lens = mask.gt(0).sum(dim=1).long()
 
         with torch.set_grad_enabled(self.train_text_encoder):
             embeds = self.text_encoder(input_ids, mask).last_hidden_state
-        # Zero-pad to max_length (replicate pipeline logic)
-        embeds = [u[:v] for u, v in zip(embeds, seq_lens, strict=False)]
-        embeds = torch.stack(
-            [torch.cat([u, u.new_zeros(max_length - u.size(0), u.size(1))]) for u in embeds],
-            dim=0,
-        )
+        embeds = embeds.masked_fill(~mask.bool().unsqueeze(-1), 0)
         return embeds.to(torch.bfloat16)
 
     @torch.no_grad()
@@ -215,8 +260,7 @@ class WanI2VForTraining:
             (B, z_dim, T', H', W') normalized latents.
         """
         latents = self.vae.encode(video.to(self.vae.dtype)).latent_dist.mode()
-        mean = self.latents_mean.to(latents.device, latents.dtype)
-        std_inv = self.latents_std_inv.to(latents.device, latents.dtype)
+        mean, std_inv = self._get_latent_stats(latents.device, latents.dtype)
         return ((latents - mean) * std_inv).to(torch.bfloat16)
 
     def prepare_condition(
@@ -243,32 +287,22 @@ class WanI2VForTraining:
             (B, 4 + z_dim, T', H', W') condition tensor.
         """
         B = image.shape[0]
-        latent_h = height // self.vae_scale_factor_spatial
-        latent_w = width // self.vae_scale_factor_spatial
 
         # ---- Encode condition video: [first_frame, zeros...] ----
-        cond_video = torch.zeros(B, 3, num_frames, height, width, device=image.device, dtype=image.dtype)
+        cond_video = image.new_zeros((B, 3, num_frames, height, width))
         cond_video[:, :, 0] = image
         # Use mode() (argmax) like the pipeline does for condition
         with torch.no_grad():
             cond_latents = self.vae.encode(cond_video.to(self.vae.dtype)).latent_dist.mode()
-        mean = self.latents_mean.to(cond_latents.device, cond_latents.dtype)
-        std_inv = self.latents_std_inv.to(cond_latents.device, cond_latents.dtype)
+        mean, std_inv = self._get_latent_stats(cond_latents.device, cond_latents.dtype)
         cond_latents = ((cond_latents - mean) * std_inv).to(torch.bfloat16)
 
         # ---- Construct mask (replicate pipeline_wan_i2v.py L468-481) ----
-        # Start with pixel-frame-level mask: 1 at frame 0, 0 elsewhere
-        mask = torch.ones(B, 1, num_frames, latent_h, latent_w, device=image.device)
-        mask[:, :, 1:] = 0
+        mask = self._get_condition_mask_template(image.device, cond_latents.dtype, num_frames, height, width).expand(
+            B, -1, -1, -1, -1
+        )
 
-        # Expand first frame across vae_scale_factor_temporal positions
-        first_frame_mask = mask[:, :, 0:1]
-        first_frame_mask = first_frame_mask.repeat(1, 1, self.vae_scale_factor_temporal, 1, 1)
-        mask = torch.cat([first_frame_mask, mask[:, :, 1:]], dim=2)
-        # Reshape to latent temporal grid: (B, T', vae_temporal, H', W') -> transpose -> (B, vae_temporal, T', H', W')
-        mask = mask.view(B, -1, self.vae_scale_factor_temporal, latent_h, latent_w).transpose(1, 2)
-
-        return torch.cat([mask.to(cond_latents), cond_latents], dim=1)
+        return torch.cat([mask, cond_latents], dim=1)
 
     # ------------------------------------------------------------------
     # Training forward
@@ -302,21 +336,19 @@ class WanI2VForTraining:
         """
         B = video_latents.shape[0]
         device = video_latents.device
+        shifted_sigmas, shifted_timesteps, bsmntw = self._get_training_buffers(device)
 
         # Sample random timestep indices, then look up shifted sigma / timestep
         if self.train_experts == "high":
-            # boundary_ratio=0.9 -> index 0..99 maps to high-noise (shifted_timestep >= 900)
-            boundary_idx = int((1.0 - self.boundary_timestep / self.num_train_timesteps) * self.num_train_timesteps)
-            indices = torch.randint(0, boundary_idx, (B,), device=device)
+            indices = torch.randint(0, self.boundary_idx, (B,), device=device)
         elif self.train_experts == "low":
-            boundary_idx = int((1.0 - self.boundary_timestep / self.num_train_timesteps) * self.num_train_timesteps)
-            indices = torch.randint(boundary_idx, self.num_train_timesteps, (B,), device=device)
+            indices = torch.randint(self.boundary_idx, self.num_train_timesteps, (B,), device=device)
         else:
             indices = torch.randint(0, self.num_train_timesteps, (B,), device=device)
 
-        sigmas = self.shifted_sigmas.to(device)[indices].view(B, 1, 1, 1, 1)
-        timesteps = self.shifted_timesteps.to(device)[indices]
-        weights = self.bsmntw.to(device)[indices]
+        sigmas = shifted_sigmas.index_select(0, indices).view(B, 1, 1, 1, 1)
+        timesteps = shifted_timesteps.index_select(0, indices)
+        weights = bsmntw.index_select(0, indices)
 
         # Flow matching: noisy = sigma * noise + (1 - sigma) * x0
         noise = torch.randn_like(video_latents)
@@ -331,26 +363,27 @@ class WanI2VForTraining:
         # Route to the correct MoE expert(s)
         experts = []
         if self.transformer is not None:
-            experts.append((timesteps >= self.boundary_timestep, self.transformer))
+            experts.append(((timesteps >= self.boundary_timestep).nonzero(as_tuple=False).flatten(), self.transformer))
         if self.transformer_2 is not None:
-            experts.append((timesteps < self.boundary_timestep, self.transformer_2))
+            experts.append(((timesteps < self.boundary_timestep).nonzero(as_tuple=False).flatten(), self.transformer_2))
 
         loss = torch.tensor(0.0, device=device, dtype=torch.float32)
         total_weight = torch.tensor(0.0, device=device, dtype=torch.float32)
 
-        for mask, transformer in experts:
-            if not mask.any():
+        for selected, transformer in experts:
+            if selected.numel() == 0:
                 continue
             pred = transformer(
-                hidden_states=model_input[mask],
-                timestep=timesteps[mask],
-                encoder_hidden_states=prompt_embeds[mask],
+                hidden_states=model_input.index_select(0, selected),
+                timestep=timesteps.index_select(0, selected),
+                encoder_hidden_states=prompt_embeds.index_select(0, selected),
                 return_dict=False,
             )[0]
             # Per-sample MSE weighted by BSMNTW
-            per_sample_loss = F.mse_loss(pred.float(), target[mask].float(), reduction="none")
+            per_sample_loss = F.mse_loss(pred.float(), target.index_select(0, selected).float(), reduction="none")
             per_sample_loss = per_sample_loss.mean(dim=list(range(1, per_sample_loss.ndim)))
-            loss = loss + (per_sample_loss * weights[mask]).sum()
-            total_weight = total_weight + weights[mask].sum()
+            selected_weights = weights.index_select(0, selected)
+            loss = loss + (per_sample_loss * selected_weights).sum()
+            total_weight = total_weight + selected_weights.sum()
 
         return loss / total_weight if total_weight > 0 else loss

@@ -16,6 +16,8 @@ class TrainConfig(BaseModel):
     width: int = 832
     fps: int = 16
     num_workers: int = 4
+    persistent_workers: bool = True
+    prefetch_factor: int = 2
 
     # Training
     output_dir: str = "storage/checkpoints"
@@ -29,10 +31,12 @@ class TrainConfig(BaseModel):
     save_steps: int = 500
     log_steps: int = 10
     seed: int = 42
+    ema_decay: float = 0.0  # 0 = disabled; typical value: 0.9999
 
     # Which components to train
     train_experts: Literal["both", "high", "low"] = "both"
     train_text_encoder: bool = False
+    gradient_checkpointing: bool = True
 
     # FSDP2 mixed precision
     param_dtype: Literal["bfloat16", "float32"] = "bfloat16"

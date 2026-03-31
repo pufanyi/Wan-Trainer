@@ -73,6 +73,8 @@ All fields with defaults — override in YAML or via CLI flags.
 | `width` | 832 | Video width |
 | `fps` | 16 | Target sampling FPS |
 | `num_workers` | 4 | Dataloader workers |
+| `persistent_workers` | true | Keep dataloader workers alive across epochs |
+| `prefetch_factor` | 2 | Worker-side prefetch depth |
 | `output_dir` | `storage/checkpoints` | Checkpoint output dir |
 | `batch_size` | 1 | Per-GPU batch size |
 | `gradient_accumulation_steps` | 4 | Micro-batches per optimizer step |

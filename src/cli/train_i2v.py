@@ -17,8 +17,8 @@ def main():
     parser.add_argument("--config", type=str, default=None, help="YAML/JSON config file")
     # CLI overrides (auto-generated from TrainConfig fields)
     for name, field_info in TrainConfig.model_fields.items():
-        if field_info.annotation is str or field_info.default is None:
-            parser.add_argument(f"--{name}", type=str, default=None)
+        if field_info.annotation is bool:
+            parser.add_argument(f"--{name}", action=argparse.BooleanOptionalAction, default=None)
         elif field_info.annotation is int:
             parser.add_argument(f"--{name}", type=int, default=None)
         elif field_info.annotation is float:

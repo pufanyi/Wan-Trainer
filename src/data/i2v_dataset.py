@@ -50,7 +50,7 @@ class I2VDataset(Dataset):
         return str(self.base_dir / p)
 
     def _load_video(self, video_path: str) -> torch.Tensor:
-        """Load video frames, resized and normalized to [-1, 1]. Returns (C, T, H, W)."""
+        """Load video frames as uint8. Returns (C, T, H, W)."""
         vr = decord.VideoReader(video_path, width=self.width, height=self.height)
         video_fps = vr.get_avg_fps()
         total_frames = len(vr)
@@ -64,13 +64,14 @@ class I2VDataset(Dataset):
             indices.append(indices[-1])
 
         frames = vr.get_batch(indices)  # (T, H, W, C) uint8 torch tensor
-        video = frames.permute(3, 0, 1, 2).float() / 127.5 - 1.0  # (C, T, H, W) in [-1, 1]
-        return video
+        return frames.permute(3, 0, 1, 2).contiguous()
 
     def _load_image(self, path: str) -> torch.Tensor:
-        """Load a single image, resized and normalized to [-1, 1]. Returns (C, H, W)."""
-        img = Image.open(path).convert("RGB").resize((self.width, self.height), Image.LANCZOS)
-        return torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 127.5 - 1.0
+        """Load a single image as uint8. Returns (C, H, W)."""
+        with Image.open(path) as img:
+            img = img.convert("RGB").resize((self.width, self.height), Image.LANCZOS)
+            array = np.asarray(img, dtype=np.uint8)
+        return torch.from_numpy(array).permute(2, 0, 1).contiguous()
 
     def __getitem__(self, idx):
         item = self.data[idx]
@@ -83,6 +84,7 @@ class I2VDataset(Dataset):
         image = self._load_image(self._resolve(raw_image)) if raw_image else video[:, 0].clone()
 
         return {
+            "index": idx,
             "video": video,
             "image": image,
             "prompt": item["prompt"],
