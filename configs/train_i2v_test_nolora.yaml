@@ -20,3 +20,5 @@ log_steps: 1
 seed: 42
 
 lora_rank: 0
+
+wandb_project: wan-i2v

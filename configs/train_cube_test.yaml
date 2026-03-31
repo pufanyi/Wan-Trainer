@@ -18,3 +18,5 @@ warmup_steps: 5
 save_steps: 0
 log_steps: 1
 seed: 42
+
+wandb_project: wan-i2v
