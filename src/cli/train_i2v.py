@@ -1,19 +1,20 @@
 """Wan2.2 I2V training entry point.
 
 Usage:
-    torchrun --nproc_per_node=2 -m src.cli.train_i2v --config configs/train_i2v.json
+    torchrun --nproc_per_node=2 -m src.cli.train_i2v --config configs/train_i2v.yaml
 """
 
 import argparse
-import json
 from pathlib import Path
+
+import yaml
 
 from src.trainer import I2VTrainer, TrainConfig
 
 
 def main():
     parser = argparse.ArgumentParser(description="Wan2.2 I2V Training")
-    parser.add_argument("--config", type=str, default=None, help="JSON config file")
+    parser.add_argument("--config", type=str, default=None, help="YAML/JSON config file")
     # CLI overrides (auto-generated from TrainConfig fields)
     for name, field_info in TrainConfig.model_fields.items():
         if field_info.annotation is str or field_info.default is None:
@@ -29,7 +30,7 @@ def main():
     # Build config: defaults -> JSON -> CLI
     cfg_dict = {}
     if args.config:
-        cfg_dict = json.loads(Path(args.config).read_text())
+        cfg_dict = yaml.safe_load(Path(args.config).read_text()) or {}
     for name in TrainConfig.model_fields:
         v = getattr(args, name, None)
         if v is not None:

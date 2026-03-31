@@ -46,18 +46,27 @@ class WanI2VForTraining:
         model_path: str,
         lora_config: LoRATrainConfig | None = None,
         train_experts: str = "both",
+        train_text_encoder: bool = False,
     ):
-        assert train_experts in ("both", "high", "low"), f"train_experts must be 'both', 'high', or 'low', got '{train_experts}'"
+        assert train_experts in ("both", "high", "low"), (
+            f"train_experts must be 'both', 'high', or 'low', got '{train_experts}'"
+        )
         self.train_experts = train_experts
+        self.train_text_encoder = train_text_encoder
 
         pipe = WanImageToVideoPipeline.from_pretrained(model_path, torch_dtype=torch.bfloat16)
 
-        # ---- Frozen components ----
+        # ---- Text encoder ----
         self.tokenizer = pipe.tokenizer
         self.text_encoder: UMT5EncoderModel = pipe.text_encoder
-        self.text_encoder.requires_grad_(False)
-        self.text_encoder.eval()
+        if train_text_encoder:
+            self.text_encoder.train()
+            self.text_encoder.gradient_checkpointing_enable()
+        else:
+            self.text_encoder.requires_grad_(False)
+            self.text_encoder.eval()
 
+        # ---- VAE (always frozen) ----
         self.vae: AutoencoderKLWan = pipe.vae
         self.vae.requires_grad_(False)
         self.vae.eval()
@@ -116,6 +125,8 @@ class WanI2VForTraining:
     def trainable_parameters(self) -> list[torch.nn.Parameter]:
         """Return a list (not generator) of all trainable parameters."""
         params = []
+        if self.train_text_encoder:
+            params.extend(p for p in self.text_encoder.parameters() if p.requires_grad)
         for m in [self.transformer, self.transformer_2]:
             if m is not None:
                 params.extend(p for p in m.parameters() if p.requires_grad)
@@ -136,7 +147,6 @@ class WanI2VForTraining:
     # Encoding helpers (all run under torch.no_grad)
     # ------------------------------------------------------------------
 
-    @torch.no_grad()
     def encode_text(self, prompts: list[str], device: torch.device) -> torch.Tensor:
         """Encode prompts to text embeddings. Returns (B, 512, text_dim)."""
         max_length = 512
@@ -155,9 +165,10 @@ class WanI2VForTraining:
         mask = tokens.attention_mask.to(device)
         seq_lens = mask.gt(0).sum(dim=1).long()
 
-        embeds = self.text_encoder(input_ids, mask).last_hidden_state
+        with torch.set_grad_enabled(self.train_text_encoder):
+            embeds = self.text_encoder(input_ids, mask).last_hidden_state
         # Zero-pad to max_length (replicate pipeline logic)
-        embeds = [u[:v] for u, v in zip(embeds, seq_lens)]
+        embeds = [u[:v] for u, v in zip(embeds, seq_lens, strict=False)]
         embeds = torch.stack(
             [torch.cat([u, u.new_zeros(max_length - u.size(0), u.size(1))]) for u in embeds],
             dim=0,
@@ -179,7 +190,6 @@ class WanI2VForTraining:
         std_inv = self.latents_std_inv.to(latents.device, latents.dtype)
         return ((latents - mean) * std_inv).to(torch.bfloat16)
 
-    @torch.no_grad()
     def prepare_condition(
         self,
         image: torch.Tensor,
@@ -211,7 +221,8 @@ class WanI2VForTraining:
         cond_video = torch.zeros(B, 3, num_frames, height, width, device=image.device, dtype=image.dtype)
         cond_video[:, :, 0] = image
         # Use mode() (argmax) like the pipeline does for condition
-        cond_latents = self.vae.encode(cond_video.to(self.vae.dtype)).latent_dist.mode()
+        with torch.no_grad():
+            cond_latents = self.vae.encode(cond_video.to(self.vae.dtype)).latent_dist.mode()
         mean = self.latents_mean.to(cond_latents.device, cond_latents.dtype)
         std_inv = self.latents_std_inv.to(cond_latents.device, cond_latents.dtype)
         cond_latents = ((cond_latents - mean) * std_inv).to(torch.bfloat16)

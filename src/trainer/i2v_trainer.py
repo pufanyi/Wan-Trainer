@@ -74,17 +74,37 @@ class I2VTrainer:
         logger.info("World size: %d", self.world_size)
 
         # ---- Model ----
-        lora_cfg = LoRATrainConfig(rank=cfg.lora_rank, lora_alpha=cfg.lora_alpha, lora_dropout=cfg.lora_dropout) if cfg.lora_rank > 0 else None
-        logger.info("Loading model from %s (lora_rank=%d, experts=%s) ...", cfg.model_path, cfg.lora_rank, cfg.train_experts)
-        self.model = WanI2VForTraining(cfg.model_path, lora_config=lora_cfg, train_experts=cfg.train_experts)
+        lora_cfg = (
+            LoRATrainConfig(rank=cfg.lora_rank, lora_alpha=cfg.lora_alpha, lora_dropout=cfg.lora_dropout)
+            if cfg.lora_rank > 0
+            else None
+        )
+        logger.info(
+            "Loading model from %s (lora_rank=%d, experts=%s) ...",
+            cfg.model_path,
+            cfg.lora_rank,
+            cfg.train_experts,
+        )
+        self.model = WanI2VForTraining(
+            cfg.model_path,
+            lora_config=lora_cfg,
+            train_experts=cfg.train_experts,
+            train_text_encoder=cfg.train_text_encoder,
+        )
 
         # Move frozen parts to GPU
         self.model.text_encoder.to(self.device)
         self.model.vae.to(self.device)
 
-        # FSDP2 shard trainable transformers
+        # FSDP2 shard trainable modules
         mesh = init_device_mesh("cuda", (self.world_size,))
-        mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+        dtype_map = {"bfloat16": torch.bfloat16, "float32": torch.float32}
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=dtype_map[cfg.param_dtype],
+            reduce_dtype=dtype_map[cfg.reduce_dtype],
+        )
+        if cfg.train_text_encoder:
+            fully_shard(self.model.text_encoder, mesh=mesh, mp_policy=mp_policy)
         if self.model.transformer is not None:
             _shard_transformer(self.model.transformer, mesh, mp_policy)
         if self.model.transformer_2 is not None:
@@ -110,12 +130,19 @@ class I2VTrainer:
         )
         self.sampler = sampler
 
-        # ---- Optimizer (one per transformer for correct DCP state_dict mapping) ----
+        # ---- Optimizer (one per FSDP module for correct DCP state_dict mapping) ----
+        self.optimizer_te = None
         self.optimizer_1 = None
         self.optimizer_2 = None
         self.params = []
         total_params = 0
         optim_kwargs = dict(lr=cfg.learning_rate, weight_decay=cfg.weight_decay, betas=(0.9, 0.999))
+
+        if cfg.train_text_encoder:
+            params_te = [p for p in self.model.text_encoder.parameters() if p.requires_grad]
+            self.params.extend(params_te)
+            total_params += sum(p.numel() for p in self.model.text_encoder.parameters())
+            self.optimizer_te = torch.optim.AdamW(params_te, **optim_kwargs)
 
         if self.model.transformer is not None:
             params_1 = [p for p in self.model.transformer.parameters() if p.requires_grad]
@@ -130,7 +157,12 @@ class I2VTrainer:
             self.optimizer_2 = torch.optim.AdamW(params_2, **optim_kwargs)
 
         trainable_count = sum(p.numel() for p in self.params)
-        logger.info("Trainable: %.1fM / %.1fM (%.2f%%)", trainable_count / 1e6, total_params / 1e6, 100 * trainable_count / total_params)
+        logger.info(
+            "Trainable: %.1fM / %.1fM (%.2f%%)",
+            trainable_count / 1e6,
+            total_params / 1e6,
+            100 * trainable_count / total_params,
+        )
 
         self.total_steps = cfg.num_epochs * len(self.dataloader) // cfg.gradient_accumulation_steps
         logger.info(
@@ -141,10 +173,12 @@ class I2VTrainer:
         )
 
         # ---- DCP state ----
-        self.optimizers = [opt for opt in [self.optimizer_1, self.optimizer_2] if opt is not None]
+        self.optimizers = [opt for opt in [self.optimizer_te, self.optimizer_1, self.optimizer_2] if opt is not None]
         self.train_state = TrainState(
+            text_encoder=self.model.text_encoder if cfg.train_text_encoder else None,
             transformer=self.model.transformer,
             transformer_2=self.model.transformer_2,
+            optimizer_te=self.optimizer_te,
             optimizer_1=self.optimizer_1,
             optimizer_2=self.optimizer_2,
         )
@@ -223,8 +257,8 @@ class I2VTrainer:
 
     def _train_step(self, batch: dict) -> torch.Tensor:
         """Single forward pass: encode frozen inputs, compute loss."""
-        video = batch["video"].to(self.device)   # (B, C, T, H, W)
-        image = batch["image"].to(self.device)    # (B, C, H, W)
+        video = batch["video"].to(self.device)  # (B, C, T, H, W)
+        image = batch["image"].to(self.device)  # (B, C, H, W)
         prompts = batch["prompt"]
 
         prompt_embeds = self.model.encode_text(prompts, self.device)

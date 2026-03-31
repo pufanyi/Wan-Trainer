@@ -5,28 +5,48 @@ from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_di
 from torch.distributed.checkpoint.stateful import Stateful
 
 
+def _save_pair(sd: dict, key: str, model, optimizer):
+    """Save model + optimizer state_dict pair into sd[key] and sd[key_optim]."""
+    if model is not None and optimizer is not None:
+        m_sd, o_sd = get_state_dict(model, optimizer)
+        sd[key] = m_sd
+        sd[f"optimizer_{key}"] = o_sd
+
+
+def _load_pair(state_dict: dict, key: str, model, optimizer):
+    """Load model + optimizer state_dict pair from state_dict."""
+    if model is not None and optimizer is not None and key in state_dict:
+        set_state_dict(
+            model,
+            optimizer,
+            model_state_dict=state_dict[key],
+            optim_state_dict=state_dict[f"optimizer_{key}"],
+        )
+
+
 class TrainState(Stateful):
-    """Wraps model + optimizer for DCP save/load via the Stateful protocol.
+    """Wraps models + optimizers for DCP save/load via the Stateful protocol.
 
-    DCP calls state_dict() / load_state_dict() automatically.
-    get_state_dict / set_state_dict handle FSDP2 FQN translation and sharding.
-
-    Each transformer has its own optimizer so that get_state_dict can correctly
-    map parameter IDs to FQNs.
+    Each FSDP-sharded module has its own optimizer so that get_state_dict can
+    correctly map parameter IDs to FQNs.
     """
 
     def __init__(
         self,
+        text_encoder: torch.nn.Module | None = None,
         transformer: torch.nn.Module | None = None,
         transformer_2: torch.nn.Module | None = None,
+        optimizer_te: torch.optim.Optimizer | None = None,
         optimizer_1: torch.optim.Optimizer | None = None,
         optimizer_2: torch.optim.Optimizer | None = None,
         step: int = 0,
         epoch: int = 0,
         batch_idx: int = 0,
     ):
+        self.text_encoder = text_encoder
         self.transformer = transformer
         self.transformer_2 = transformer_2
+        self.optimizer_te = optimizer_te
         self.optimizer_1 = optimizer_1
         self.optimizer_2 = optimizer_2
         self.step = step
@@ -35,31 +55,15 @@ class TrainState(Stateful):
 
     def state_dict(self):
         sd = {"step": self.step, "epoch": self.epoch, "batch_idx": self.batch_idx}
-        if self.transformer is not None and self.optimizer_1 is not None:
-            t1_model_sd, t1_optim_sd = get_state_dict(self.transformer, self.optimizer_1)
-            sd["transformer"] = t1_model_sd
-            sd["optimizer_transformer"] = t1_optim_sd
-        if self.transformer_2 is not None and self.optimizer_2 is not None:
-            t2_model_sd, t2_optim_sd = get_state_dict(self.transformer_2, self.optimizer_2)
-            sd["transformer_2"] = t2_model_sd
-            sd["optimizer_transformer_2"] = t2_optim_sd
+        _save_pair(sd, "text_encoder", self.text_encoder, self.optimizer_te)
+        _save_pair(sd, "transformer", self.transformer, self.optimizer_1)
+        _save_pair(sd, "transformer_2", self.transformer_2, self.optimizer_2)
         return sd
 
     def load_state_dict(self, state_dict):
-        if self.transformer is not None and self.optimizer_1 is not None and "transformer" in state_dict:
-            set_state_dict(
-                self.transformer,
-                self.optimizer_1,
-                model_state_dict=state_dict["transformer"],
-                optim_state_dict=state_dict["optimizer_transformer"],
-            )
-        if self.transformer_2 is not None and self.optimizer_2 is not None and "transformer_2" in state_dict:
-            set_state_dict(
-                self.transformer_2,
-                self.optimizer_2,
-                model_state_dict=state_dict["transformer_2"],
-                optim_state_dict=state_dict["optimizer_transformer_2"],
-            )
+        _load_pair(state_dict, "text_encoder", self.text_encoder, self.optimizer_te)
+        _load_pair(state_dict, "transformer", self.transformer, self.optimizer_1)
+        _load_pair(state_dict, "transformer_2", self.transformer_2, self.optimizer_2)
         self.step = state_dict["step"]
         self.epoch = state_dict["epoch"]
         self.batch_idx = state_dict.get("batch_idx", 0)

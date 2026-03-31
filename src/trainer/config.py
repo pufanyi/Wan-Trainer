@@ -30,8 +30,13 @@ class TrainConfig(BaseModel):
     log_steps: int = 10
     seed: int = 42
 
-    # MoE expert selection
+    # Which components to train
     train_experts: Literal["both", "high", "low"] = "both"
+    train_text_encoder: bool = False
+
+    # FSDP2 mixed precision
+    param_dtype: Literal["bfloat16", "float32"] = "bfloat16"
+    reduce_dtype: Literal["float32", "bfloat16"] = "float32"
 
     # LoRA (set lora_rank > 0 to enable)
     lora_rank: int = 0

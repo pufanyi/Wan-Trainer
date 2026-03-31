@@ -3,8 +3,8 @@
 JSON format:
 [
     {
-        "video": "path/to/video.mp4",
-        "image": "path/to/first_frame.jpg",  // optional, uses first video frame if absent
+        "video": "path/to/video.mp4",             // absolute or relative to JSON dir
+        "image": "ref.jpg" | ["ref.jpg"],          // optional, uses first video frame if absent
         "prompt": "description of the video"
     }
 ]
@@ -31,7 +31,9 @@ class I2VDataset(Dataset):
         width: int = 832,
         fps: int = 16,
     ):
-        self.data = json.loads(Path(json_path).read_text())
+        json_path = Path(json_path)
+        self.base_dir = json_path.parent
+        self.data = json.loads(json_path.read_text())
         self.num_frames = num_frames
         self.height = height
         self.width = width
@@ -39,6 +41,13 @@ class I2VDataset(Dataset):
 
     def __len__(self):
         return len(self.data)
+
+    def _resolve(self, path: str) -> str:
+        """Resolve path: absolute stays absolute, relative resolves from JSON dir."""
+        p = Path(path)
+        if p.is_absolute():
+            return str(p)
+        return str(self.base_dir / p)
 
     def _load_video(self, video_path: str) -> torch.Tensor:
         """Load video frames, resized and normalized to [-1, 1]. Returns (C, T, H, W)."""
@@ -65,13 +74,13 @@ class I2VDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.data[idx]
-        video = self._load_video(item["video"])  # (C, T, H, W)
+        video = self._load_video(self._resolve(item["video"]))  # (C, T, H, W)
 
-        # First frame: use explicit image if provided, else extract from video
-        if "image" in item and item["image"]:
-            image = self._load_image(item["image"])
-        else:
-            image = video[:, 0].clone()  # (C, H, W)
+        # Reference image: string, list (use first element), or absent (first video frame)
+        raw_image = item.get("image")
+        if isinstance(raw_image, list):
+            raw_image = raw_image[0] if raw_image else None
+        image = self._load_image(self._resolve(raw_image)) if raw_image else video[:, 0].clone()
 
         return {
             "video": video,
