@@ -45,3 +45,7 @@ class TrainConfig(BaseModel):
 
     # Checkpoint
     resume_from: str | None = None
+
+    # Logging
+    wandb_project: str | None = None
+    wandb_run_name: str | None = None

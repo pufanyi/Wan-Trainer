@@ -187,6 +187,17 @@ class I2VTrainer:
         # ---- MFU monitor ----
         self.mfu_monitor = self._setup_mfu()
 
+        # ---- Wandb ----
+        self.use_wandb = cfg.wandb_project is not None and self.rank == 0
+        if self.use_wandb:
+            import wandb
+
+            wandb.init(
+                project=cfg.wandb_project,
+                name=cfg.wandb_run_name,
+                config=cfg.model_dump(),
+            )
+
         # ---- Resume ----
         if cfg.resume_from:
             self._load_checkpoint(cfg.resume_from)
@@ -265,7 +276,7 @@ class I2VTrainer:
                 scaled_loss.backward()
 
                 if (batch_idx + 1) % cfg.gradient_accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(self.params, cfg.max_grad_norm)
+                    self._last_grad_norm = torch.nn.utils.clip_grad_norm_(self.params, cfg.max_grad_norm).item()
 
                     lr = _cosine_lr(global_step, cfg.warmup_steps, self.total_steps, cfg.learning_rate)
                     for opt in self.optimizers:
@@ -289,6 +300,18 @@ class I2VTrainer:
                             lr,
                             mfu_str,
                         )
+                        if self.use_wandb:
+                            import wandb
+
+                            metrics = {
+                                "train/loss": loss.item(),
+                                "train/lr": lr,
+                                "train/epoch": epoch,
+                                "train/grad_norm": self._last_grad_norm,
+                            }
+                            if mfu is not None:
+                                metrics["train/mfu"] = mfu
+                            wandb.log(metrics, step=global_step)
 
                     if cfg.save_steps > 0 and global_step % cfg.save_steps == 0:
                         self.train_state.step = global_step
@@ -304,6 +327,10 @@ class I2VTrainer:
             if self.rank == 0:
                 logger.info("Epoch %d done.", epoch)
 
+        if self.use_wandb:
+            import wandb
+
+            wandb.finish()
         dist.destroy_process_group()
 
     def _train_step(self, batch: dict) -> torch.Tensor:

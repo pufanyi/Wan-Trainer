@@ -17,3 +17,7 @@ warmup_steps: 100
 save_steps: 500
 log_steps: 10
 seed: 42
+
+# wandb (set wandb_project to enable)
+# wandb_project: wan-i2v
+# wandb_run_name: null

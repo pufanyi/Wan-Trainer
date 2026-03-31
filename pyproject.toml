@@ -17,6 +17,7 @@ dependencies = [
     "regex>=2026.3.32",
     "torch>=2.11.0",
     "transformers>=5.4.0",
+    "wandb>=0.25.1",
 ]
 
 [dependency-groups]
