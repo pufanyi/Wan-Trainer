@@ -1,13 +1,14 @@
 """Wan2.2 I2V Trainer with FSDP2 + Distributed Checkpoint (DCP)."""
 
-import logging
 import math
 import os
+import sys
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
+from loguru import logger
 from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.device_mesh import init_device_mesh
 from torch.utils.data import DataLoader, DistributedSampler
@@ -17,9 +18,6 @@ from src.models.wan_i2v import LoRATrainConfig, WanI2VForTraining
 from src.trainer.checkpoint import TrainState
 from src.trainer.config import TrainConfig
 from src.trainer.flops import MFUMonitor, compute_wan_seq_len, estimate_wan_forward_flops, get_gpu_peak_flops_bf16
-
-logger = logging.getLogger(__name__)
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -49,6 +47,15 @@ def _shard_transformer(module, mesh, mp_policy):
     fully_shard(module, mesh=mesh, mp_policy=mp_policy)
 
 
+def _setup_loguru(rank: int) -> None:
+    """Configure loguru: rich sink on rank 0, silence other ranks."""
+    logger.remove()
+    if rank == 0:
+        logger.add(sys.stderr, colorize=True, format="<level>{level: <8}</level> | {message}", level="INFO")
+    else:
+        logger.disable("src")
+
+
 # ---------------------------------------------------------------------------
 # Trainer
 # ---------------------------------------------------------------------------
@@ -67,14 +74,9 @@ class I2VTrainer:
         torch.cuda.set_device(self.device)
         torch.manual_seed(cfg.seed + self.rank)
 
-        if self.rank == 0:
-            from rich.logging import RichHandler
+        _setup_loguru(self.rank)
 
-            logging.basicConfig(level=logging.INFO, handlers=[RichHandler(rich_tracebacks=True, show_path=False)])
-        else:
-            logging.basicConfig(level=logging.WARNING)
-
-        logger.info("World size: %d", self.world_size)
+        logger.info("World size: {}", self.world_size)
 
         # ---- Model ----
         lora_cfg = (
@@ -83,7 +85,7 @@ class I2VTrainer:
             else None
         )
         logger.info(
-            "Loading model from %s (lora_rank=%d, experts=%s) ...",
+            "Loading model from {} (lora_rank={}, experts={}) ...",
             cfg.model_path,
             cfg.lora_rank,
             cfg.train_experts,
@@ -161,7 +163,7 @@ class I2VTrainer:
 
         trainable_count = sum(p.numel() for p in self.params)
         logger.info(
-            "Trainable: %.1fM / %.1fM (%.2f%%)",
+            "Trainable: {:.1f}M / {:.1f}M ({:.2f}%)",
             trainable_count / 1e6,
             total_params / 1e6,
             100 * trainable_count / total_params,
@@ -169,7 +171,7 @@ class I2VTrainer:
 
         self.total_steps = cfg.num_epochs * len(self.dataloader) // cfg.gradient_accumulation_steps
         logger.info(
-            "Dataset: %d samples, %d batches/epoch, %d total optimizer steps",
+            "Dataset: {} samples, {} batches/epoch, {} total optimizer steps",
             len(dataset),
             len(self.dataloader),
             self.total_steps,
@@ -235,15 +237,14 @@ class I2VTrainer:
         # Training = forward(1x) + backward(2x) per sample, times micro-batches per optimizer step
         flops_per_step = 3 * forward_flops * self.cfg.batch_size * self.cfg.gradient_accumulation_steps
 
-        if self.rank == 0:
-            logger.info(
-                "MFU monitor: seq_len=%d, forward=%.2e FLOPs/sample, step=%.2e FLOPs, GPU=%s (%.0f TFLOPS bf16)",
-                seq_len,
-                forward_flops,
-                flops_per_step,
-                torch.cuda.get_device_name(0),
-                gpu_peak / 1e12,
-            )
+        logger.info(
+            "MFU monitor: seq_len={}, forward={:.2e} FLOPs/sample, step={:.2e} FLOPs, GPU={} ({:.0f} TFLOPS bf16)",
+            seq_len,
+            forward_flops,
+            flops_per_step,
+            torch.cuda.get_device_name(0),
+            gpu_peak / 1e12,
+        )
         return MFUMonitor(flops_per_step, gpu_peak)
 
     # ------------------------------------------------------------------
@@ -357,8 +358,7 @@ class I2VTrainer:
             self.train_state.epoch = epoch + 1
             self.train_state.batch_idx = 0
             self._save_checkpoint(output_dir / f"checkpoint-epoch{epoch}")
-            if self.rank == 0:
-                logger.info("Epoch %d done.", epoch)
+            logger.info("Epoch {} done.", epoch)
 
         if progress is not None:
             progress.stop()
@@ -392,15 +392,15 @@ class I2VTrainer:
         if self.rank == 0 and self.model.lora_config is not None:
             self.model.save_lora(str(path / "lora"))
         if self.rank == 0:
-            logger.info("Saved DCP checkpoint to %s", path)
+            logger.info("Saved DCP checkpoint to {}", path)
         dist.barrier()
 
     def _load_checkpoint(self, path: str):
         """Load with DCP. Supports resharding across different world sizes."""
-        logger.info("Resuming from %s ...", path)
+        logger.info("Resuming from {} ...", path)
         dcp.load({"train_state": self.train_state}, checkpoint_id=path)
         logger.info(
-            "Resumed at step=%d epoch=%d batch_idx=%d",
+            "Resumed at step={} epoch={} batch_idx={}",
             self.train_state.step,
             self.train_state.epoch,
             self.train_state.batch_idx,

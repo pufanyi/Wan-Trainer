@@ -1,10 +1,7 @@
 """FLOPs estimation and MFU monitoring for Wan I2V training."""
 
-import logging
-
 import torch
-
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 
 def compute_wan_seq_len(
@@ -69,7 +66,7 @@ def get_gpu_peak_flops_bf16() -> float | None:
     for key, tflops in _GPU_PEAK_TFLOPS_BF16.items():
         if key in name:
             return tflops * 1e12
-    logger.warning("Unknown GPU %r — MFU disabled. Add entry to _GPU_PEAK_TFLOPS_BF16.", name)
+    logger.warning("Unknown GPU {!r} — MFU disabled. Add entry to _GPU_PEAK_TFLOPS_BF16.", name)
     return None
 
 
