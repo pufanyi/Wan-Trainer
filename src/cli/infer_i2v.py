@@ -1,4 +1,8 @@
-"""Wan2.2 Image-to-Video inference script using diffusers."""
+"""Wan2.2 Image-to-Video inference script using diffusers.
+
+Usage:
+    python -m src.cli.infer_i2v --image path/to/image.jpg --prompt "description"
+"""
 
 import argparse
 from pathlib import Path

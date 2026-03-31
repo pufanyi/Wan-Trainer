@@ -3,126 +3,21 @@
 import logging
 import math
 import os
-from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
-from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
-from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.device_mesh import init_device_mesh
 from torch.utils.data import DataLoader, DistributedSampler
 
 from src.data.i2v_dataset import I2VDataset
 from src.models.wan_i2v import LoRATrainConfig, WanI2VForTraining
+from src.trainer.checkpoint import TrainState
+from src.trainer.config import TrainConfig
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class TrainConfig:
-    # Model
-    model_path: str = "storage/models/Wan2.2-I2V-A14B-Diffusers"
-
-    # Data
-    dataset_json: str = "data/train.json"
-    num_frames: int = 81
-    height: int = 480
-    width: int = 832
-    fps: int = 16
-    num_workers: int = 4
-
-    # Training
-    output_dir: str = "storage/checkpoints"
-    batch_size: int = 1
-    gradient_accumulation_steps: int = 4
-    num_epochs: int = 1
-    learning_rate: float = 1e-5
-    weight_decay: float = 0.01
-    max_grad_norm: float = 1.0
-    warmup_steps: int = 100
-    save_steps: int = 500
-    log_steps: int = 10
-    seed: int = 42
-
-    # LoRA (set lora_rank > 0 to enable)
-    lora_rank: int = 0
-    lora_alpha: int = 16
-    lora_dropout: float = 0.0
-
-    # Checkpoint
-    resume_from: str | None = None
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "TrainConfig":
-        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
-
-
-# ---------------------------------------------------------------------------
-# DCP Stateful wrapper
-# ---------------------------------------------------------------------------
-
-
-class TrainState(Stateful):
-    """Wraps model + optimizer for DCP save/load via the Stateful protocol.
-
-    DCP calls state_dict() / load_state_dict() automatically.
-    get_state_dict / set_state_dict handle FSDP2 FQN translation and sharding.
-
-    Each transformer has its own optimizer so that get_state_dict can correctly
-    map parameter IDs to FQNs.
-    """
-
-    def __init__(
-        self,
-        transformer: torch.nn.Module,
-        transformer_2: torch.nn.Module,
-        optimizer_1: torch.optim.Optimizer,
-        optimizer_2: torch.optim.Optimizer,
-        step: int = 0,
-        epoch: int = 0,
-    ):
-        self.transformer = transformer
-        self.transformer_2 = transformer_2
-        self.optimizer_1 = optimizer_1
-        self.optimizer_2 = optimizer_2
-        self.step = step
-        self.epoch = epoch
-
-    def state_dict(self):
-        t1_model_sd, t1_optim_sd = get_state_dict(self.transformer, self.optimizer_1)
-        t2_model_sd, t2_optim_sd = get_state_dict(self.transformer_2, self.optimizer_2)
-        return {
-            "transformer": t1_model_sd,
-            "transformer_2": t2_model_sd,
-            "optimizer_transformer": t1_optim_sd,
-            "optimizer_transformer_2": t2_optim_sd,
-            "step": self.step,
-            "epoch": self.epoch,
-        }
-
-    def load_state_dict(self, state_dict):
-        set_state_dict(
-            self.transformer,
-            self.optimizer_1,
-            model_state_dict=state_dict["transformer"],
-            optim_state_dict=state_dict["optimizer_transformer"],
-        )
-        set_state_dict(
-            self.transformer_2,
-            self.optimizer_2,
-            model_state_dict=state_dict["transformer_2"],
-            optim_state_dict=state_dict["optimizer_transformer_2"],
-        )
-        self.step = state_dict["step"]
-        self.epoch = state_dict["epoch"]
 
 
 # ---------------------------------------------------------------------------

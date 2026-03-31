@@ -1,17 +1,14 @@
 """Wan2.2 I2V training entry point.
 
 Usage:
-    torchrun --nproc_per_node=2 scripts/train/i2v.py --config configs/train_i2v.json
+    torchrun --nproc_per_node=2 -m src.cli.train_i2v --config configs/train_i2v.json
 """
 
 import argparse
 import json
-import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-from src.trainer.i2v_trainer import I2VTrainer, TrainConfig
+from src.trainer import I2VTrainer, TrainConfig
 
 
 def main():
