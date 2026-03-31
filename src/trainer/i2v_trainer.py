@@ -165,12 +165,21 @@ class I2VTrainer:
         global_step = self.train_state.step
         start_epoch = self.train_state.epoch
 
+        # On resume, skip batches already processed in the interrupted epoch.
+        # DistributedSampler with the same seed+epoch produces the same order,
+        # so skipping reproduces the exact same data sequence.
+        resume_batch_idx = self.train_state.batch_idx
+
         for epoch in range(start_epoch, cfg.num_epochs):
             self.sampler.set_epoch(epoch)
             for opt in self.optimizers:
                 opt.zero_grad()
 
             for batch_idx, batch in enumerate(self.dataloader):
+                if batch_idx < resume_batch_idx:
+                    continue  # skip already-processed batches
+                resume_batch_idx = 0  # only skip in the first (resumed) epoch
+
                 loss = self._train_step(batch)
                 scaled_loss = loss / cfg.gradient_accumulation_steps
                 scaled_loss.backward()
@@ -199,11 +208,13 @@ class I2VTrainer:
                     if cfg.save_steps > 0 and global_step % cfg.save_steps == 0:
                         self.train_state.step = global_step
                         self.train_state.epoch = epoch
+                        self.train_state.batch_idx = batch_idx + 1
                         self._save_checkpoint(output_dir / f"checkpoint-{global_step}")
 
-            # End-of-epoch save
+            # End-of-epoch save (batch_idx=0 means start fresh next epoch)
             self.train_state.step = global_step
             self.train_state.epoch = epoch + 1
+            self.train_state.batch_idx = 0
             self._save_checkpoint(output_dir / f"checkpoint-epoch{epoch}")
             if self.rank == 0:
                 logger.info("Epoch %d done.", epoch)
@@ -240,4 +251,9 @@ class I2VTrainer:
         """Load with DCP. Supports resharding across different world sizes."""
         logger.info("Resuming from %s ...", path)
         dcp.load({"train_state": self.train_state}, checkpoint_id=path)
-        logger.info("Resumed at step=%d epoch=%d", self.train_state.step, self.train_state.epoch)
+        logger.info(
+            "Resumed at step=%d epoch=%d batch_idx=%d",
+            self.train_state.step,
+            self.train_state.epoch,
+            self.train_state.batch_idx,
+        )

@@ -23,6 +23,7 @@ class TrainState(Stateful):
         optimizer_2: torch.optim.Optimizer | None = None,
         step: int = 0,
         epoch: int = 0,
+        batch_idx: int = 0,
     ):
         self.transformer = transformer
         self.transformer_2 = transformer_2
@@ -30,9 +31,10 @@ class TrainState(Stateful):
         self.optimizer_2 = optimizer_2
         self.step = step
         self.epoch = epoch
+        self.batch_idx = batch_idx
 
     def state_dict(self):
-        sd = {"step": self.step, "epoch": self.epoch}
+        sd = {"step": self.step, "epoch": self.epoch, "batch_idx": self.batch_idx}
         if self.transformer is not None and self.optimizer_1 is not None:
             t1_model_sd, t1_optim_sd = get_state_dict(self.transformer, self.optimizer_1)
             sd["transformer"] = t1_model_sd
@@ -60,3 +62,4 @@ class TrainState(Stateful):
             )
         self.step = state_dict["step"]
         self.epoch = state_dict["epoch"]
+        self.batch_idx = state_dict.get("batch_idx", 0)
