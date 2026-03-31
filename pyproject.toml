@@ -19,6 +19,7 @@ dependencies = [
     "torchvision>=0.26.0",
     "transformers>=5.4.0",
     "wandb>=0.25.1",
+    "rich>=14.0",
 ]
 
 [dependency-groups]

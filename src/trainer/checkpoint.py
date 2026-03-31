@@ -25,7 +25,7 @@ def _load_pair(state_dict: dict, key: str, model, optimizer):
 
 
 class TrainState(Stateful):
-    """Wraps models + optimizers for DCP save/load via the Stateful protocol.
+    """Wraps models + optimizers + RNG states for DCP save/load via the Stateful protocol.
 
     Each FSDP-sharded module has its own optimizer so that get_state_dict can
     correctly map parameter IDs to FQNs.
@@ -58,6 +58,9 @@ class TrainState(Stateful):
         _save_pair(sd, "text_encoder", self.text_encoder, self.optimizer_te)
         _save_pair(sd, "transformer", self.transformer, self.optimizer_1)
         _save_pair(sd, "transformer_2", self.transformer_2, self.optimizer_2)
+        # RNG states for reproducibility on resume
+        sd["rng_cpu"] = torch.random.get_rng_state()
+        sd["rng_cuda"] = torch.cuda.get_rng_state()
         return sd
 
     def load_state_dict(self, state_dict):
@@ -67,3 +70,8 @@ class TrainState(Stateful):
         self.step = state_dict["step"]
         self.epoch = state_dict["epoch"]
         self.batch_idx = state_dict.get("batch_idx", 0)
+        # Restore RNG states
+        if "rng_cpu" in state_dict:
+            torch.random.set_rng_state(state_dict["rng_cpu"])
+        if "rng_cuda" in state_dict:
+            torch.cuda.set_rng_state(state_dict["rng_cuda"])

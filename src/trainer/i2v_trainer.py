@@ -68,7 +68,9 @@ class I2VTrainer:
         torch.manual_seed(cfg.seed + self.rank)
 
         if self.rank == 0:
-            logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
+            from rich.logging import RichHandler
+
+            logging.basicConfig(level=logging.INFO, handlers=[RichHandler(rich_tracebacks=True, show_path=False)])
         else:
             logging.basicConfig(level=logging.WARNING)
 
@@ -261,6 +263,38 @@ class I2VTrainer:
         # so skipping reproduces the exact same data sequence.
         resume_batch_idx = self.train_state.batch_idx
 
+        if self.rank == 0:
+            from rich.console import Console
+            from rich.progress import (
+                BarColumn,
+                MofNCompleteColumn,
+                Progress,
+                SpinnerColumn,
+                TextColumn,
+                TimeElapsedColumn,
+                TimeRemainingColumn,
+            )
+
+            console = Console()
+            progress = Progress(
+                SpinnerColumn(),
+                TextColumn("[bold blue]{task.description}"),
+                BarColumn(bar_width=None),
+                MofNCompleteColumn(),
+                TextColumn("•"),
+                TimeElapsedColumn(),
+                TextColumn("<"),
+                TimeRemainingColumn(),
+                TextColumn("•"),
+                TextColumn("{task.fields[metrics]}"),
+                console=console,
+                expand=True,
+            )
+            task_id = progress.add_task("Training", total=self.total_steps, completed=global_step, metrics="")
+            progress.start()
+        else:
+            progress = None
+
         for epoch in range(start_epoch, cfg.num_epochs):
             self.sampler.set_epoch(epoch)
             for opt in self.optimizers:
@@ -290,28 +324,27 @@ class I2VTrainer:
 
                     if self.rank == 0 and global_step % cfg.log_steps == 0:
                         mfu = self.mfu_monitor.flush() if self.mfu_monitor is not None else None
-                        mfu_str = f" mfu={mfu:.1%}" if mfu is not None else ""
-                        logger.info(
-                            "epoch=%d step=%d/%d loss=%.4f lr=%.2e%s",
-                            epoch,
-                            global_step,
-                            self.total_steps,
-                            loss.item(),
-                            lr,
-                            mfu_str,
+                        mfu_str = f"  mfu [green]{mfu:.1%}[/]" if mfu is not None else ""
+                        metrics = (
+                            f"epoch {epoch}  loss [yellow]{loss.item():.4f}[/]  "
+                            f"lr [cyan]{lr:.2e}[/]  ‖∇‖ {self._last_grad_norm:.4f}{mfu_str}"
                         )
+                        progress.update(task_id, completed=global_step, metrics=metrics)
+
                         if self.use_wandb:
                             import wandb
 
-                            metrics = {
+                            log_metrics = {
                                 "train/loss": loss.item(),
                                 "train/lr": lr,
                                 "train/epoch": epoch,
                                 "train/grad_norm": self._last_grad_norm,
                             }
                             if mfu is not None:
-                                metrics["train/mfu"] = mfu
-                            wandb.log(metrics, step=global_step)
+                                log_metrics["train/mfu"] = mfu
+                            wandb.log(log_metrics, step=global_step)
+                    elif progress is not None:
+                        progress.update(task_id, completed=global_step)
 
                     if cfg.save_steps > 0 and global_step % cfg.save_steps == 0:
                         self.train_state.step = global_step
@@ -326,6 +359,9 @@ class I2VTrainer:
             self._save_checkpoint(output_dir / f"checkpoint-epoch{epoch}")
             if self.rank == 0:
                 logger.info("Epoch %d done.", epoch)
+
+        if progress is not None:
+            progress.stop()
 
         if self.use_wandb:
             import wandb
