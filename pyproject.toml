@@ -12,6 +12,7 @@ dependencies = [
     "imageio>=2.37.3",
     "imageio-ffmpeg>=0.6.0",
     "numpy>=2.4.4",
+    "peft>=0.18.1",
     "regex>=2026.3.32",
     "torch>=2.11.0",
     "transformers>=5.4.0",

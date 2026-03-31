@@ -5,6 +5,7 @@ components from the WanImageToVideoPipeline.
 """
 
 import html
+from dataclasses import dataclass
 
 import ftfy
 import regex as re
@@ -12,7 +13,22 @@ import torch
 import torch.nn.functional as F
 from diffusers import AutoencoderKLWan, WanImageToVideoPipeline
 from diffusers.models import WanTransformer3DModel
+from peft import LoraConfig
 from transformers import UMT5EncoderModel
+
+
+@dataclass
+class LoRATrainConfig:
+    """LoRA configuration for Wan I2V transformers."""
+
+    rank: int = 16
+    lora_alpha: int = 16
+    target_modules: list[str] | None = None
+    lora_dropout: float = 0.0
+
+    def __post_init__(self):
+        if self.target_modules is None:
+            self.target_modules = ["to_q", "to_k", "to_v", "to_out.0"]
 
 
 def _clean_prompt(text: str) -> str:
@@ -30,7 +46,7 @@ class WanI2VForTraining:
     Trainable: transformer (high-noise expert), transformer_2 (low-noise expert).
     """
 
-    def __init__(self, model_path: str):
+    def __init__(self, model_path: str, lora_config: LoRATrainConfig | None = None):
         pipe = WanImageToVideoPipeline.from_pretrained(model_path, torch_dtype=torch.bfloat16)
 
         # ---- Frozen components ----
@@ -43,9 +59,29 @@ class WanI2VForTraining:
         self.vae.requires_grad_(False)
         self.vae.eval()
 
-        # ---- Trainable transformers ----
+        # ---- Transformers ----
         self.transformer: WanTransformer3DModel = pipe.transformer
         self.transformer_2: WanTransformer3DModel = pipe.transformer_2
+
+        # ---- LoRA or full fine-tuning ----
+        self.lora_config = lora_config
+        if lora_config is not None:
+            peft_config = LoraConfig(
+                r=lora_config.rank,
+                lora_alpha=lora_config.lora_alpha,
+                target_modules=lora_config.target_modules,
+                lora_dropout=lora_config.lora_dropout,
+            )
+            self.transformer.add_adapter(peft_config)
+            self.transformer_2.add_adapter(peft_config)
+            # Freeze base weights; only LoRA params are trainable
+            self.transformer.requires_grad_(False)
+            self.transformer_2.requires_grad_(False)
+            for m in [self.transformer, self.transformer_2]:
+                for name, param in m.named_parameters():
+                    if "lora_" in name:
+                        param.requires_grad = True
+
         self.transformer.train()
         self.transformer_2.train()
         self.transformer.enable_gradient_checkpointing()
@@ -69,7 +105,18 @@ class WanI2VForTraining:
 
     def trainable_parameters(self) -> list[torch.nn.Parameter]:
         """Return a list (not generator) of all trainable parameters."""
-        return list(self.transformer.parameters()) + list(self.transformer_2.parameters())
+        return [p for p in self.transformer.parameters() if p.requires_grad] + [
+            p for p in self.transformer_2.parameters() if p.requires_grad
+        ]
+
+    def save_lora(self, path: str):
+        """Save LoRA adapter weights for both transformers."""
+        from pathlib import Path
+
+        out = Path(path)
+        out.mkdir(parents=True, exist_ok=True)
+        self.transformer.save_pretrained(out / "transformer")
+        self.transformer_2.save_pretrained(out / "transformer_2")
 
     # ------------------------------------------------------------------
     # Encoding helpers (all run under torch.no_grad)

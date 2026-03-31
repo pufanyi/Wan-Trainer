@@ -16,7 +16,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.utils.data import DataLoader, DistributedSampler
 
 from src.data.i2v_dataset import I2VDataset
-from src.models.wan_i2v import WanI2VForTraining
+from src.models.wan_i2v import LoRATrainConfig, WanI2VForTraining
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +51,11 @@ class TrainConfig:
     save_steps: int = 500
     log_steps: int = 10
     seed: int = 42
+
+    # LoRA (set lora_rank > 0 to enable)
+    lora_rank: int = 0
+    lora_alpha: int = 16
+    lora_dropout: float = 0.0
 
     # Checkpoint
     resume_from: str | None = None
@@ -169,8 +174,9 @@ class I2VTrainer:
         logger.info("World size: %d", self.world_size)
 
         # ---- Model ----
-        logger.info("Loading model from %s ...", cfg.model_path)
-        self.model = WanI2VForTraining(cfg.model_path)
+        lora_cfg = LoRATrainConfig(rank=cfg.lora_rank, lora_alpha=cfg.lora_alpha, lora_dropout=cfg.lora_dropout) if cfg.lora_rank > 0 else None
+        logger.info("Loading model from %s (lora_rank=%d) ...", cfg.model_path, cfg.lora_rank)
+        self.model = WanI2VForTraining(cfg.model_path, lora_config=lora_cfg)
 
         # Move frozen parts to GPU
         self.model.text_encoder.to(self.device)
@@ -204,6 +210,9 @@ class I2VTrainer:
 
         # ---- Optimizer ----
         self.params = self.model.trainable_parameters()
+        total_params = sum(p.numel() for p in self.model.transformer.parameters()) + sum(p.numel() for p in self.model.transformer_2.parameters())
+        trainable_count = sum(p.numel() for p in self.params)
+        logger.info("Trainable: %.1fM / %.1fM (%.2f%%)", trainable_count / 1e6, total_params / 1e6, 100 * trainable_count / total_params)
         self.optimizer = torch.optim.AdamW(
             self.params,
             lr=cfg.learning_rate,
@@ -305,8 +314,12 @@ class I2VTrainer:
     def _save_checkpoint(self, path: Path):
         """Save with DCP. All ranks participate; each writes its own shards."""
         dcp.save({"train_state": self.train_state}, checkpoint_id=str(path))
+        # Also save LoRA adapter weights in portable PEFT format (rank 0 only)
+        if self.rank == 0 and self.model.lora_config is not None:
+            self.model.save_lora(str(path / "lora"))
         if self.rank == 0:
             logger.info("Saved DCP checkpoint to %s", path)
+        dist.barrier()
 
     def _load_checkpoint(self, path: str):
         """Load with DCP. Supports resharding across different world sizes."""
