@@ -75,8 +75,8 @@ class I2VTrainer:
 
         # ---- Model ----
         lora_cfg = LoRATrainConfig(rank=cfg.lora_rank, lora_alpha=cfg.lora_alpha, lora_dropout=cfg.lora_dropout) if cfg.lora_rank > 0 else None
-        logger.info("Loading model from %s (lora_rank=%d) ...", cfg.model_path, cfg.lora_rank)
-        self.model = WanI2VForTraining(cfg.model_path, lora_config=lora_cfg)
+        logger.info("Loading model from %s (lora_rank=%d, experts=%s) ...", cfg.model_path, cfg.lora_rank, cfg.train_experts)
+        self.model = WanI2VForTraining(cfg.model_path, lora_config=lora_cfg, train_experts=cfg.train_experts)
 
         # Move frozen parts to GPU
         self.model.text_encoder.to(self.device)
@@ -85,8 +85,10 @@ class I2VTrainer:
         # FSDP2 shard trainable transformers
         mesh = init_device_mesh("cuda", (self.world_size,))
         mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
-        _shard_transformer(self.model.transformer, mesh, mp_policy)
-        _shard_transformer(self.model.transformer_2, mesh, mp_policy)
+        if self.model.transformer is not None:
+            _shard_transformer(self.model.transformer, mesh, mp_policy)
+        if self.model.transformer_2 is not None:
+            _shard_transformer(self.model.transformer_2, mesh, mp_policy)
 
         # ---- Dataset ----
         dataset = I2VDataset(
@@ -109,15 +111,26 @@ class I2VTrainer:
         self.sampler = sampler
 
         # ---- Optimizer (one per transformer for correct DCP state_dict mapping) ----
-        self.params_1 = [p for p in self.model.transformer.parameters() if p.requires_grad]
-        self.params_2 = [p for p in self.model.transformer_2.parameters() if p.requires_grad]
-        self.params = self.params_1 + self.params_2
-        total_params = sum(p.numel() for p in self.model.transformer.parameters()) + sum(p.numel() for p in self.model.transformer_2.parameters())
+        self.optimizer_1 = None
+        self.optimizer_2 = None
+        self.params = []
+        total_params = 0
+        optim_kwargs = dict(lr=cfg.learning_rate, weight_decay=cfg.weight_decay, betas=(0.9, 0.999))
+
+        if self.model.transformer is not None:
+            params_1 = [p for p in self.model.transformer.parameters() if p.requires_grad]
+            self.params.extend(params_1)
+            total_params += sum(p.numel() for p in self.model.transformer.parameters())
+            self.optimizer_1 = torch.optim.AdamW(params_1, **optim_kwargs)
+
+        if self.model.transformer_2 is not None:
+            params_2 = [p for p in self.model.transformer_2.parameters() if p.requires_grad]
+            self.params.extend(params_2)
+            total_params += sum(p.numel() for p in self.model.transformer_2.parameters())
+            self.optimizer_2 = torch.optim.AdamW(params_2, **optim_kwargs)
+
         trainable_count = sum(p.numel() for p in self.params)
         logger.info("Trainable: %.1fM / %.1fM (%.2f%%)", trainable_count / 1e6, total_params / 1e6, 100 * trainable_count / total_params)
-        optim_kwargs = dict(lr=cfg.learning_rate, weight_decay=cfg.weight_decay, betas=(0.9, 0.999))
-        self.optimizer_1 = torch.optim.AdamW(self.params_1, **optim_kwargs)
-        self.optimizer_2 = torch.optim.AdamW(self.params_2, **optim_kwargs)
 
         self.total_steps = cfg.num_epochs * len(self.dataloader) // cfg.gradient_accumulation_steps
         logger.info(
@@ -128,6 +141,7 @@ class I2VTrainer:
         )
 
         # ---- DCP state ----
+        self.optimizers = [opt for opt in [self.optimizer_1, self.optimizer_2] if opt is not None]
         self.train_state = TrainState(
             transformer=self.model.transformer,
             transformer_2=self.model.transformer_2,
@@ -153,8 +167,8 @@ class I2VTrainer:
 
         for epoch in range(start_epoch, cfg.num_epochs):
             self.sampler.set_epoch(epoch)
-            self.optimizer_1.zero_grad()
-            self.optimizer_2.zero_grad()
+            for opt in self.optimizers:
+                opt.zero_grad()
 
             for batch_idx, batch in enumerate(self.dataloader):
                 loss = self._train_step(batch)
@@ -165,7 +179,7 @@ class I2VTrainer:
                     torch.nn.utils.clip_grad_norm_(self.params, cfg.max_grad_norm)
 
                     lr = _cosine_lr(global_step, cfg.warmup_steps, self.total_steps, cfg.learning_rate)
-                    for opt in [self.optimizer_1, self.optimizer_2]:
+                    for opt in self.optimizers:
                         for pg in opt.param_groups:
                             pg["lr"] = lr
                         opt.step()

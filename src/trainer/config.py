@@ -1,10 +1,11 @@
 """Training configuration."""
 
-from dataclasses import dataclass
+from typing import Literal
+
+from pydantic import BaseModel
 
 
-@dataclass
-class TrainConfig:
+class TrainConfig(BaseModel):
     # Model
     model_path: str = "storage/models/Wan2.2-I2V-A14B-Diffusers"
 
@@ -29,6 +30,9 @@ class TrainConfig:
     log_steps: int = 10
     seed: int = 42
 
+    # MoE expert selection
+    train_experts: Literal["both", "high", "low"] = "both"
+
     # LoRA (set lora_rank > 0 to enable)
     lora_rank: int = 0
     lora_alpha: int = 16
@@ -36,7 +40,3 @@ class TrainConfig:
 
     # Checkpoint
     resume_from: str | None = None
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "TrainConfig":
-        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})

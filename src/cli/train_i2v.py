@@ -15,24 +15,27 @@ def main():
     parser = argparse.ArgumentParser(description="Wan2.2 I2V Training")
     parser.add_argument("--config", type=str, default=None, help="JSON config file")
     # CLI overrides (auto-generated from TrainConfig fields)
-    for f, field_obj in TrainConfig.__dataclass_fields__.items():
-        default = field_obj.default
-        if default is None:
-            parser.add_argument(f"--{f}", type=str, default=None)
+    for name, field_info in TrainConfig.model_fields.items():
+        if field_info.annotation is str or field_info.default is None:
+            parser.add_argument(f"--{name}", type=str, default=None)
+        elif field_info.annotation is int:
+            parser.add_argument(f"--{name}", type=int, default=None)
+        elif field_info.annotation is float:
+            parser.add_argument(f"--{name}", type=float, default=None)
         else:
-            parser.add_argument(f"--{f}", type=type(default), default=None)
+            parser.add_argument(f"--{name}", type=str, default=None)
     args = parser.parse_args()
 
     # Build config: defaults -> JSON -> CLI
     cfg_dict = {}
     if args.config:
         cfg_dict = json.loads(Path(args.config).read_text())
-    for f in TrainConfig.__dataclass_fields__:
-        v = getattr(args, f, None)
+    for name in TrainConfig.model_fields:
+        v = getattr(args, name, None)
         if v is not None:
-            cfg_dict[f] = v
+            cfg_dict[name] = v
 
-    cfg = TrainConfig.from_dict(cfg_dict)
+    cfg = TrainConfig(**cfg_dict)
     trainer = I2VTrainer(cfg)
     trainer.train()
 

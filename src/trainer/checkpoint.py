@@ -17,10 +17,10 @@ class TrainState(Stateful):
 
     def __init__(
         self,
-        transformer: torch.nn.Module,
-        transformer_2: torch.nn.Module,
-        optimizer_1: torch.optim.Optimizer,
-        optimizer_2: torch.optim.Optimizer,
+        transformer: torch.nn.Module | None = None,
+        transformer_2: torch.nn.Module | None = None,
+        optimizer_1: torch.optim.Optimizer | None = None,
+        optimizer_2: torch.optim.Optimizer | None = None,
         step: int = 0,
         epoch: int = 0,
     ):
@@ -32,29 +32,31 @@ class TrainState(Stateful):
         self.epoch = epoch
 
     def state_dict(self):
-        t1_model_sd, t1_optim_sd = get_state_dict(self.transformer, self.optimizer_1)
-        t2_model_sd, t2_optim_sd = get_state_dict(self.transformer_2, self.optimizer_2)
-        return {
-            "transformer": t1_model_sd,
-            "transformer_2": t2_model_sd,
-            "optimizer_transformer": t1_optim_sd,
-            "optimizer_transformer_2": t2_optim_sd,
-            "step": self.step,
-            "epoch": self.epoch,
-        }
+        sd = {"step": self.step, "epoch": self.epoch}
+        if self.transformer is not None and self.optimizer_1 is not None:
+            t1_model_sd, t1_optim_sd = get_state_dict(self.transformer, self.optimizer_1)
+            sd["transformer"] = t1_model_sd
+            sd["optimizer_transformer"] = t1_optim_sd
+        if self.transformer_2 is not None and self.optimizer_2 is not None:
+            t2_model_sd, t2_optim_sd = get_state_dict(self.transformer_2, self.optimizer_2)
+            sd["transformer_2"] = t2_model_sd
+            sd["optimizer_transformer_2"] = t2_optim_sd
+        return sd
 
     def load_state_dict(self, state_dict):
-        set_state_dict(
-            self.transformer,
-            self.optimizer_1,
-            model_state_dict=state_dict["transformer"],
-            optim_state_dict=state_dict["optimizer_transformer"],
-        )
-        set_state_dict(
-            self.transformer_2,
-            self.optimizer_2,
-            model_state_dict=state_dict["transformer_2"],
-            optim_state_dict=state_dict["optimizer_transformer_2"],
-        )
+        if self.transformer is not None and self.optimizer_1 is not None and "transformer" in state_dict:
+            set_state_dict(
+                self.transformer,
+                self.optimizer_1,
+                model_state_dict=state_dict["transformer"],
+                optim_state_dict=state_dict["optimizer_transformer"],
+            )
+        if self.transformer_2 is not None and self.optimizer_2 is not None and "transformer_2" in state_dict:
+            set_state_dict(
+                self.transformer_2,
+                self.optimizer_2,
+                model_state_dict=state_dict["transformer_2"],
+                optim_state_dict=state_dict["optimizer_transformer_2"],
+            )
         self.step = state_dict["step"]
         self.epoch = state_dict["epoch"]

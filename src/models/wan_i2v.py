@@ -5,7 +5,6 @@ components from the WanImageToVideoPipeline.
 """
 
 import html
-from dataclasses import dataclass
 
 import ftfy
 import regex as re
@@ -14,21 +13,17 @@ import torch.nn.functional as F
 from diffusers import AutoencoderKLWan, WanImageToVideoPipeline
 from diffusers.models import WanTransformer3DModel
 from peft import LoraConfig
+from pydantic import BaseModel
 from transformers import UMT5EncoderModel
 
 
-@dataclass
-class LoRATrainConfig:
+class LoRATrainConfig(BaseModel):
     """LoRA configuration for Wan I2V transformers."""
 
     rank: int = 16
     lora_alpha: int = 16
-    target_modules: list[str] | None = None
+    target_modules: list[str] = ["to_q", "to_k", "to_v", "to_out.0"]
     lora_dropout: float = 0.0
-
-    def __post_init__(self):
-        if self.target_modules is None:
-            self.target_modules = ["to_q", "to_k", "to_v", "to_out.0"]
 
 
 def _clean_prompt(text: str) -> str:
@@ -46,7 +41,15 @@ class WanI2VForTraining:
     Trainable: transformer (high-noise expert), transformer_2 (low-noise expert).
     """
 
-    def __init__(self, model_path: str, lora_config: LoRATrainConfig | None = None):
+    def __init__(
+        self,
+        model_path: str,
+        lora_config: LoRATrainConfig | None = None,
+        train_experts: str = "both",
+    ):
+        assert train_experts in ("both", "high", "low"), f"train_experts must be 'both', 'high', or 'low', got '{train_experts}'"
+        self.train_experts = train_experts
+
         pipe = WanImageToVideoPipeline.from_pretrained(model_path, torch_dtype=torch.bfloat16)
 
         # ---- Frozen components ----
@@ -59,9 +62,14 @@ class WanI2VForTraining:
         self.vae.requires_grad_(False)
         self.vae.eval()
 
-        # ---- Transformers ----
-        self.transformer: WanTransformer3DModel = pipe.transformer
-        self.transformer_2: WanTransformer3DModel = pipe.transformer_2
+        # ---- Transformers (only load what we need) ----
+        self.transformer: WanTransformer3DModel | None = None
+        self.transformer_2: WanTransformer3DModel | None = None
+
+        if train_experts in ("both", "high"):
+            self.transformer = pipe.transformer
+        if train_experts in ("both", "low"):
+            self.transformer_2 = pipe.transformer_2
 
         # ---- LoRA or full fine-tuning ----
         self.lora_config = lora_config
@@ -72,24 +80,22 @@ class WanI2VForTraining:
                 target_modules=lora_config.target_modules,
                 lora_dropout=lora_config.lora_dropout,
             )
-            self.transformer.add_adapter(peft_config)
-            self.transformer_2.add_adapter(peft_config)
-            # Freeze base weights; only LoRA params are trainable
-            self.transformer.requires_grad_(False)
-            self.transformer_2.requires_grad_(False)
             for m in [self.transformer, self.transformer_2]:
+                if m is None:
+                    continue
+                m.add_adapter(peft_config)
+                m.requires_grad_(False)
                 for name, param in m.named_parameters():
                     if "lora_" in name:
                         param.requires_grad = True
 
-        # Ensure uniform dtype for FSDP2 (some params load as float32)
-        self.transformer.to(torch.bfloat16)
-        self.transformer_2.to(torch.bfloat16)
-
-        self.transformer.train()
-        self.transformer_2.train()
-        self.transformer.enable_gradient_checkpointing()
-        self.transformer_2.enable_gradient_checkpointing()
+        for m in [self.transformer, self.transformer_2]:
+            if m is None:
+                continue
+            # Ensure uniform dtype for FSDP2 (some params load as float32)
+            m.to(torch.bfloat16)
+            m.train()
+            m.enable_gradient_checkpointing()
 
         # ---- VAE normalization constants ----
         vae_cfg = self.vae.config
@@ -109,18 +115,22 @@ class WanI2VForTraining:
 
     def trainable_parameters(self) -> list[torch.nn.Parameter]:
         """Return a list (not generator) of all trainable parameters."""
-        return [p for p in self.transformer.parameters() if p.requires_grad] + [
-            p for p in self.transformer_2.parameters() if p.requires_grad
-        ]
+        params = []
+        for m in [self.transformer, self.transformer_2]:
+            if m is not None:
+                params.extend(p for p in m.parameters() if p.requires_grad)
+        return params
 
     def save_lora(self, path: str):
-        """Save LoRA adapter weights for both transformers."""
+        """Save LoRA adapter weights for active transformers."""
         from pathlib import Path
 
         out = Path(path)
         out.mkdir(parents=True, exist_ok=True)
-        self.transformer.save_pretrained(out / "transformer")
-        self.transformer_2.save_pretrained(out / "transformer_2")
+        if self.transformer is not None:
+            self.transformer.save_pretrained(out / "transformer")
+        if self.transformer_2 is not None:
+            self.transformer_2.save_pretrained(out / "transformer_2")
 
     # ------------------------------------------------------------------
     # Encoding helpers (all run under torch.no_grad)
@@ -252,8 +262,14 @@ class WanI2VForTraining:
         B = video_latents.shape[0]
         device = video_latents.device
 
-        # Sample random timesteps; sigma = t / 1000
-        timesteps = torch.randint(0, self.num_train_timesteps, (B,), device=device)
+        # Sample random timesteps from the active expert's range
+        if self.train_experts == "high":
+            timesteps = torch.randint(self.boundary_timestep, self.num_train_timesteps, (B,), device=device)
+        elif self.train_experts == "low":
+            timesteps = torch.randint(0, self.boundary_timestep, (B,), device=device)
+        else:
+            timesteps = torch.randint(0, self.num_train_timesteps, (B,), device=device)
+
         sigmas = (timesteps.float() / self.num_train_timesteps).view(B, 1, 1, 1, 1)
 
         # Flow matching: noisy = sigma * noise + (1 - sigma) * x0
@@ -266,17 +282,17 @@ class WanI2VForTraining:
         # Model input: [noisy_latents, condition] along channel dim -> 36 channels
         model_input = torch.cat([noisy_latents, condition], dim=1)
 
-        # Route to the correct MoE expert
-        high_mask = timesteps >= self.boundary_timestep
-        low_mask = ~high_mask
+        # Route to the correct MoE expert(s)
+        experts = []
+        if self.transformer is not None:
+            experts.append((timesteps >= self.boundary_timestep, self.transformer))
+        if self.transformer_2 is not None:
+            experts.append((timesteps < self.boundary_timestep, self.transformer_2))
 
         loss = torch.tensor(0.0, device=device, dtype=torch.float32)
         count = 0
 
-        for mask, transformer in [
-            (high_mask, self.transformer),
-            (low_mask, self.transformer_2),
-        ]:
+        for mask, transformer in experts:
             if not mask.any():
                 continue
             pred = transformer(
