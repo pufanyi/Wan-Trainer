@@ -6,7 +6,6 @@ components from the WanImageToVideoPipeline.
 
 import html
 import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import ftfy
@@ -67,44 +66,15 @@ class WanI2VForTraining:
         boundary_ratio = pipe_config.get("boundary_ratio", 0.9)
         self.boundary_timestep = int(boundary_ratio * self.num_train_timesteps)  # 900
 
-        # ---- Load components in parallel ----
-        def _load_tokenizer():
-            return AutoTokenizer.from_pretrained(model_dir / "tokenizer")
-
-        def _load_text_encoder():
-            return UMT5EncoderModel.from_pretrained(
-                model_dir / "text_encoder", torch_dtype=torch.bfloat16
-            )
-
-        def _load_vae():
-            return AutoencoderKLWan.from_pretrained(
-                model_dir / "vae", torch_dtype=torch.bfloat16
-            )
-
-        def _load_transformer(subfolder: str):
-            return WanTransformer3DModel.from_pretrained(
-                model_dir / subfolder, torch_dtype=torch.bfloat16
-            )
-
-        futures = {}
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            futures["tokenizer"] = pool.submit(_load_tokenizer)
-            futures["text_encoder"] = pool.submit(_load_text_encoder)
-            futures["vae"] = pool.submit(_load_vae)
-            if train_experts in ("both", "high"):
-                futures["transformer"] = pool.submit(_load_transformer, "transformer")
-            if train_experts in ("both", "low"):
-                futures["transformer_2"] = pool.submit(_load_transformer, "transformer_2")
-
-            for fut in as_completed(futures.values()):
-                name = next(k for k, v in futures.items() if v is fut)
-                fut.result()  # raise on error
-                logger.info("Loaded {}", name)
-
-        self.tokenizer = futures["tokenizer"].result()
+        # ---- Load components sequentially ----
+        self.tokenizer = AutoTokenizer.from_pretrained(model_dir / "tokenizer")
+        logger.info("Loaded tokenizer")
 
         # ---- Text encoder ----
-        self.text_encoder: UMT5EncoderModel = futures["text_encoder"].result()
+        self.text_encoder: UMT5EncoderModel = UMT5EncoderModel.from_pretrained(
+            model_dir / "text_encoder", torch_dtype=torch.bfloat16
+        )
+        logger.info("Loaded text_encoder")
         if train_text_encoder:
             self.text_encoder.train()
             self.text_encoder.gradient_checkpointing_enable()
@@ -113,17 +83,26 @@ class WanI2VForTraining:
             self.text_encoder.eval()
 
         # ---- VAE (always frozen) ----
-        self.vae: AutoencoderKLWan = futures["vae"].result()
+        self.vae: AutoencoderKLWan = AutoencoderKLWan.from_pretrained(
+            model_dir / "vae", torch_dtype=torch.bfloat16
+        )
+        logger.info("Loaded vae")
         self.vae.requires_grad_(False)
         self.vae.eval()
 
         # ---- Transformers (only load what we need) ----
-        self.transformer: WanTransformer3DModel | None = futures.get("transformer", None)
-        if self.transformer is not None:
-            self.transformer = self.transformer.result()
-        self.transformer_2: WanTransformer3DModel | None = futures.get("transformer_2", None)
-        if self.transformer_2 is not None:
-            self.transformer_2 = self.transformer_2.result()
+        self.transformer: WanTransformer3DModel | None = None
+        self.transformer_2: WanTransformer3DModel | None = None
+        if train_experts in ("both", "high"):
+            self.transformer = WanTransformer3DModel.from_pretrained(
+                model_dir / "transformer", torch_dtype=torch.bfloat16
+            )
+            logger.info("Loaded transformer")
+        if train_experts in ("both", "low"):
+            self.transformer_2 = WanTransformer3DModel.from_pretrained(
+                model_dir / "transformer_2", torch_dtype=torch.bfloat16
+            )
+            logger.info("Loaded transformer_2")
 
         # ---- LoRA or full fine-tuning ----
         self.lora_config = lora_config
@@ -159,6 +138,18 @@ class WanI2VForTraining:
         # ---- Scale factors (from VAE config, not hardcoded) ----
         self.vae_scale_factor_spatial: int = vae_cfg.scale_factor_spatial
         self.vae_scale_factor_temporal: int = vae_cfg.scale_factor_temporal
+
+        # ---- Shifted sigma schedule (shift=5, matching DiffSynth) ----
+        shift = 5.0
+        linear_sigmas = torch.linspace(1.0, 0.0, self.num_train_timesteps + 1)[:-1]
+        self.shifted_sigmas = shift * linear_sigmas / (1 + (shift - 1) * linear_sigmas)
+        # Derive timesteps from shifted sigmas (for passing to transformer)
+        self.shifted_timesteps = (self.shifted_sigmas * self.num_train_timesteps).float()
+
+        # ---- BSMNTW loss weighting (Gaussian centered at t=500) ----
+        bsmntw = torch.exp(-2.0 * ((self.shifted_timesteps - 500.0) / 1000.0) ** 2)
+        bsmntw = bsmntw - bsmntw.min()
+        self.bsmntw = bsmntw * (self.num_train_timesteps / bsmntw.sum())
 
     def trainable_parameters(self) -> list[torch.nn.Parameter]:
         """Return a list (not generator) of all trainable parameters."""
@@ -223,7 +214,7 @@ class WanI2VForTraining:
         Returns:
             (B, z_dim, T', H', W') normalized latents.
         """
-        latents = self.vae.encode(video.to(self.vae.dtype)).latent_dist.sample()
+        latents = self.vae.encode(video.to(self.vae.dtype)).latent_dist.mode()
         mean = self.latents_mean.to(latents.device, latents.dtype)
         std_inv = self.latents_std_inv.to(latents.device, latents.dtype)
         return ((latents - mean) * std_inv).to(torch.bfloat16)
@@ -291,10 +282,11 @@ class WanI2VForTraining:
     ) -> torch.Tensor:
         """Compute flow-matching loss for one training step.
 
-        Flow matching formulation:
+        Flow matching formulation (shifted sigma schedule, shift=5):
+            sigma = 5s / (1 + 4s) where s = linear_sigma
             noisy = sigma * noise + (1 - sigma) * x0
             target = noise - x0  (velocity)
-            loss = MSE(model_pred, target)
+            loss = BSMNTW_weight * MSE(model_pred, target)
 
         MoE routing:
             timestep >= boundary (900) -> transformer  (high-noise expert)
@@ -311,15 +303,20 @@ class WanI2VForTraining:
         B = video_latents.shape[0]
         device = video_latents.device
 
-        # Sample random timesteps from the active expert's range
+        # Sample random timestep indices, then look up shifted sigma / timestep
         if self.train_experts == "high":
-            timesteps = torch.randint(self.boundary_timestep, self.num_train_timesteps, (B,), device=device)
+            # boundary_ratio=0.9 -> index 0..99 maps to high-noise (shifted_timestep >= 900)
+            boundary_idx = int((1.0 - self.boundary_timestep / self.num_train_timesteps) * self.num_train_timesteps)
+            indices = torch.randint(0, boundary_idx, (B,), device=device)
         elif self.train_experts == "low":
-            timesteps = torch.randint(0, self.boundary_timestep, (B,), device=device)
+            boundary_idx = int((1.0 - self.boundary_timestep / self.num_train_timesteps) * self.num_train_timesteps)
+            indices = torch.randint(boundary_idx, self.num_train_timesteps, (B,), device=device)
         else:
-            timesteps = torch.randint(0, self.num_train_timesteps, (B,), device=device)
+            indices = torch.randint(0, self.num_train_timesteps, (B,), device=device)
 
-        sigmas = (timesteps.float() / self.num_train_timesteps).view(B, 1, 1, 1, 1)
+        sigmas = self.shifted_sigmas.to(device)[indices].view(B, 1, 1, 1, 1)
+        timesteps = self.shifted_timesteps.to(device)[indices]
+        weights = self.bsmntw.to(device)[indices]
 
         # Flow matching: noisy = sigma * noise + (1 - sigma) * x0
         noise = torch.randn_like(video_latents)
@@ -339,7 +336,7 @@ class WanI2VForTraining:
             experts.append((timesteps < self.boundary_timestep, self.transformer_2))
 
         loss = torch.tensor(0.0, device=device, dtype=torch.float32)
-        count = 0
+        total_weight = torch.tensor(0.0, device=device, dtype=torch.float32)
 
         for mask, transformer in experts:
             if not mask.any():
@@ -350,7 +347,10 @@ class WanI2VForTraining:
                 encoder_hidden_states=prompt_embeds[mask],
                 return_dict=False,
             )[0]
-            loss = loss + F.mse_loss(pred.float(), target[mask].float(), reduction="sum")
-            count += mask.sum().item() * target[0].numel()
+            # Per-sample MSE weighted by BSMNTW
+            per_sample_loss = F.mse_loss(pred.float(), target[mask].float(), reduction="none")
+            per_sample_loss = per_sample_loss.mean(dim=list(range(1, per_sample_loss.ndim)))
+            loss = loss + (per_sample_loss * weights[mask]).sum()
+            total_weight = total_weight + weights[mask].sum()
 
-        return loss / count if count > 0 else loss
+        return loss / total_weight if total_weight > 0 else loss

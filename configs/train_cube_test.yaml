@@ -15,8 +15,10 @@ learning_rate: 1.0e-5
 weight_decay: 0.01
 max_grad_norm: 1.0
 warmup_steps: 5
-save_steps: 5
+save_steps: 200
 log_steps: 1
 seed: 42
+
+torch_compile: true
 
 wandb_project: wan-i2v

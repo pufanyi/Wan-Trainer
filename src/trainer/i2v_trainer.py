@@ -48,10 +48,38 @@ def _shard_transformer(module, mesh, mp_policy):
 
 
 def _setup_loguru(rank: int) -> None:
-    """Configure loguru: rich sink on rank 0, silence other ranks."""
+    """Configure loguru: Rich sink on rank 0, silence other ranks."""
+    from rich.console import Console
+    from rich.text import Text
+
     logger.remove()
     if rank == 0:
-        logger.add(sys.stderr, colorize=True, format="<level>{level: <8}</level> | {message}", level="INFO")
+        console = Console(stderr=True)
+
+        _LEVEL_STYLES = {
+            "DEBUG": "dim cyan",
+            "INFO": "bold green",
+            "SUCCESS": "bold green",
+            "WARNING": "bold yellow",
+            "ERROR": "bold red",
+            "CRITICAL": "bold white on red",
+        }
+
+        def _rich_sink(message):
+            record = message.record
+            level = record["level"].name
+            style = _LEVEL_STYLES.get(level, "")
+            ts = record["time"].strftime("%H:%M:%S")
+
+            line = Text()
+            line.append(ts, style="dim")
+            line.append(" | ", style="dim")
+            line.append(f"{level:<8}", style=style)
+            line.append(" | ", style="dim")
+            line.append(str(record["message"]))
+            console.print(line)
+
+        logger.add(_rich_sink, level="INFO")
     else:
         logger.disable("src")
 
@@ -114,6 +142,26 @@ class I2VTrainer:
             _shard_transformer(self.model.transformer, mesh, mp_policy)
         if self.model.transformer_2 is not None:
             _shard_transformer(self.model.transformer_2, mesh, mp_policy)
+
+        # ---- torch.compile (after FSDP sharding) ----
+        if cfg.torch_compile:
+            compile_kwargs = {"backend": cfg.torch_compile_backend}
+            if cfg.torch_compile_mode is not None:
+                compile_kwargs["mode"] = cfg.torch_compile_mode
+            # Frozen modules (inference-only, static shapes)
+            self.model.vae = torch.compile(self.model.vae, **compile_kwargs)
+            logger.info("Compiled vae")
+            if not cfg.train_text_encoder:
+                self.model.text_encoder = torch.compile(self.model.text_encoder, **compile_kwargs)
+                logger.info("Compiled text_encoder")
+            # Trainable transformers
+            if self.model.transformer is not None:
+                self.model.transformer = torch.compile(self.model.transformer, **compile_kwargs)
+                logger.info("Compiled transformer")
+            if self.model.transformer_2 is not None:
+                self.model.transformer_2 = torch.compile(self.model.transformer_2, **compile_kwargs)
+                logger.info("Compiled transformer_2")
+            logger.info("torch.compile enabled (backend={}, mode={})", cfg.torch_compile_backend, cfg.torch_compile_mode)
 
         # ---- Dataset ----
         dataset = I2VDataset(
@@ -216,7 +264,7 @@ class I2VTrainer:
         if gpu_peak is None:
             return None
 
-        t = self.model.transformer or self.model.transformer_2
+        t = self.model.transformer if self.model.transformer is not None else self.model.transformer_2
         t_cfg = t.config
 
         seq_len = compute_wan_seq_len(
@@ -266,6 +314,7 @@ class I2VTrainer:
 
         if self.rank == 0:
             from rich.console import Console
+            from rich.live import Live
             from rich.progress import (
                 BarColumn,
                 MofNCompleteColumn,
@@ -275,26 +324,39 @@ class I2VTrainer:
                 TimeElapsedColumn,
                 TimeRemainingColumn,
             )
+            from rich.table import Table as RichTable
 
             console = Console()
             progress = Progress(
                 SpinnerColumn(),
-                TextColumn("[bold blue]{task.description}"),
+                TextColumn("[bold blue]Training"),
                 BarColumn(bar_width=None),
                 MofNCompleteColumn(),
                 TextColumn("•"),
                 TimeElapsedColumn(),
                 TextColumn("<"),
                 TimeRemainingColumn(),
-                TextColumn("•"),
-                TextColumn("{task.fields[metrics]}"),
                 console=console,
                 expand=True,
             )
-            task_id = progress.add_task("Training", total=self.total_steps, completed=global_step, metrics="")
-            progress.start()
+            task_id = progress.add_task("Training", total=self.total_steps, completed=global_step)
+
+            # Metrics table (rendered below progress bar, rows accumulate)
+            metrics_table = RichTable(show_header=True, expand=True, box=None, padding=(0, 1))
+            metrics_table.add_column("step", style="bold")
+            metrics_table.add_column("epoch", style="blue")
+            metrics_table.add_column("loss", style="yellow")
+            metrics_table.add_column("lr", style="cyan")
+            metrics_table.add_column("grad_norm")
+            metrics_table.add_column("mfu", style="green")
+
+            from rich.console import Group
+
+            live = Live(Group(progress, metrics_table), console=console, refresh_per_second=10)
+            live.start()
         else:
             progress = None
+            live = None
 
         for epoch in range(start_epoch, cfg.num_epochs):
             self.sampler.set_epoch(epoch)
@@ -325,12 +387,16 @@ class I2VTrainer:
 
                     if self.rank == 0 and global_step % cfg.log_steps == 0:
                         mfu = self.mfu_monitor.flush() if self.mfu_monitor is not None else None
-                        mfu_str = f"  mfu [green]{mfu:.1%}[/]" if mfu is not None else ""
-                        metrics = (
-                            f"epoch {epoch}  loss [yellow]{loss.item():.4f}[/]  "
-                            f"lr [cyan]{lr:.2e}[/]  ‖∇‖ {self._last_grad_norm:.4f}{mfu_str}"
+                        progress.update(task_id, completed=global_step)
+
+                        metrics_table.add_row(
+                            str(global_step),
+                            str(epoch),
+                            f"{loss.item():.4f}",
+                            f"{lr:.2e}",
+                            f"{self._last_grad_norm:.4f}",
+                            f"{mfu:.1%}" if mfu is not None else "-",
                         )
-                        progress.update(task_id, completed=global_step, metrics=metrics)
 
                         if self.use_wandb:
                             import wandb
@@ -360,8 +426,8 @@ class I2VTrainer:
             self._save_checkpoint(output_dir / f"checkpoint-epoch{epoch}")
             logger.info("Epoch {} done.", epoch)
 
-        if progress is not None:
-            progress.stop()
+        if live is not None:
+            live.stop()
 
         if self.use_wandb:
             import wandb
