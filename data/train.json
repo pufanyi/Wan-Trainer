@@ -1,6 +1,7 @@
 [
     {
         "video": "data/videos/sample.mp4",
+        "image": ["data/images/sample1.jpg", "data/images/sample2.jpg"],
         "prompt": "A white cat wearing sunglasses sits on a surfboard at the beach."
     }
 ]

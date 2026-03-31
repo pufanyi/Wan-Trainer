@@ -75,25 +75,30 @@ class TrainState(Stateful):
 
     DCP calls state_dict() / load_state_dict() automatically.
     get_state_dict / set_state_dict handle FSDP2 FQN translation and sharding.
+
+    Each transformer has its own optimizer so that get_state_dict can correctly
+    map parameter IDs to FQNs.
     """
 
     def __init__(
         self,
         transformer: torch.nn.Module,
         transformer_2: torch.nn.Module,
-        optimizer: torch.optim.Optimizer,
+        optimizer_1: torch.optim.Optimizer,
+        optimizer_2: torch.optim.Optimizer,
         step: int = 0,
         epoch: int = 0,
     ):
         self.transformer = transformer
         self.transformer_2 = transformer_2
-        self.optimizer = optimizer
+        self.optimizer_1 = optimizer_1
+        self.optimizer_2 = optimizer_2
         self.step = step
         self.epoch = epoch
 
     def state_dict(self):
-        t1_model_sd, t1_optim_sd = get_state_dict(self.transformer, self.optimizer)
-        t2_model_sd, t2_optim_sd = get_state_dict(self.transformer_2, self.optimizer)
+        t1_model_sd, t1_optim_sd = get_state_dict(self.transformer, self.optimizer_1)
+        t2_model_sd, t2_optim_sd = get_state_dict(self.transformer_2, self.optimizer_2)
         return {
             "transformer": t1_model_sd,
             "transformer_2": t2_model_sd,
@@ -106,13 +111,13 @@ class TrainState(Stateful):
     def load_state_dict(self, state_dict):
         set_state_dict(
             self.transformer,
-            self.optimizer,
+            self.optimizer_1,
             model_state_dict=state_dict["transformer"],
             optim_state_dict=state_dict["optimizer_transformer"],
         )
         set_state_dict(
             self.transformer_2,
-            self.optimizer,
+            self.optimizer_2,
             model_state_dict=state_dict["transformer_2"],
             optim_state_dict=state_dict["optimizer_transformer_2"],
         )
@@ -208,17 +213,16 @@ class I2VTrainer:
         )
         self.sampler = sampler
 
-        # ---- Optimizer ----
-        self.params = self.model.trainable_parameters()
+        # ---- Optimizer (one per transformer for correct DCP state_dict mapping) ----
+        self.params_1 = [p for p in self.model.transformer.parameters() if p.requires_grad]
+        self.params_2 = [p for p in self.model.transformer_2.parameters() if p.requires_grad]
+        self.params = self.params_1 + self.params_2
         total_params = sum(p.numel() for p in self.model.transformer.parameters()) + sum(p.numel() for p in self.model.transformer_2.parameters())
         trainable_count = sum(p.numel() for p in self.params)
         logger.info("Trainable: %.1fM / %.1fM (%.2f%%)", trainable_count / 1e6, total_params / 1e6, 100 * trainable_count / total_params)
-        self.optimizer = torch.optim.AdamW(
-            self.params,
-            lr=cfg.learning_rate,
-            weight_decay=cfg.weight_decay,
-            betas=(0.9, 0.999),
-        )
+        optim_kwargs = dict(lr=cfg.learning_rate, weight_decay=cfg.weight_decay, betas=(0.9, 0.999))
+        self.optimizer_1 = torch.optim.AdamW(self.params_1, **optim_kwargs)
+        self.optimizer_2 = torch.optim.AdamW(self.params_2, **optim_kwargs)
 
         self.total_steps = cfg.num_epochs * len(self.dataloader) // cfg.gradient_accumulation_steps
         logger.info(
@@ -232,7 +236,8 @@ class I2VTrainer:
         self.train_state = TrainState(
             transformer=self.model.transformer,
             transformer_2=self.model.transformer_2,
-            optimizer=self.optimizer,
+            optimizer_1=self.optimizer_1,
+            optimizer_2=self.optimizer_2,
         )
 
         # ---- Resume ----
@@ -253,7 +258,8 @@ class I2VTrainer:
 
         for epoch in range(start_epoch, cfg.num_epochs):
             self.sampler.set_epoch(epoch)
-            self.optimizer.zero_grad()
+            self.optimizer_1.zero_grad()
+            self.optimizer_2.zero_grad()
 
             for batch_idx, batch in enumerate(self.dataloader):
                 loss = self._train_step(batch)
@@ -264,11 +270,11 @@ class I2VTrainer:
                     torch.nn.utils.clip_grad_norm_(self.params, cfg.max_grad_norm)
 
                     lr = _cosine_lr(global_step, cfg.warmup_steps, self.total_steps, cfg.learning_rate)
-                    for pg in self.optimizer.param_groups:
-                        pg["lr"] = lr
-
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
+                    for opt in [self.optimizer_1, self.optimizer_2]:
+                        for pg in opt.param_groups:
+                            pg["lr"] = lr
+                        opt.step()
+                        opt.zero_grad()
                     global_step += 1
 
                     if self.rank == 0 and global_step % cfg.log_steps == 0:

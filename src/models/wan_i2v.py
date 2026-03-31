@@ -82,6 +82,10 @@ class WanI2VForTraining:
                     if "lora_" in name:
                         param.requires_grad = True
 
+        # Ensure uniform dtype for FSDP2 (some params load as float32)
+        self.transformer.to(torch.bfloat16)
+        self.transformer_2.to(torch.bfloat16)
+
         self.transformer.train()
         self.transformer_2.train()
         self.transformer.enable_gradient_checkpointing()
