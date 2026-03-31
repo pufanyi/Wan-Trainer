@@ -217,14 +217,18 @@ def main():
 
         inp_p = torch.cat([noisy_cpu.to(DEV_P), pipe_condition], dim=1)
         pipe_pred_high_bf16 = pipe.transformer(
-            hidden_states=inp_p, timestep=ts.to(DEV_P),
-            encoder_hidden_states=pipe_embeds, return_dict=False,
+            hidden_states=inp_p,
+            timestep=ts.to(DEV_P),
+            encoder_hidden_states=pipe_embeds,
+            return_dict=False,
         )[0]
 
         inp_t = torch.cat([noisy_cpu.to(DEV_T), train_condition], dim=1)
         train_pred_high_2 = train.transformer(
-            hidden_states=inp_t, timestep=ts.to(DEV_T),
-            encoder_hidden_states=train_embeds, return_dict=False,
+            hidden_states=inp_t,
+            timestep=ts.to(DEV_T),
+            encoder_hidden_states=train_embeds,
+            return_dict=False,
         )[0]
 
         ok = check("transformer bf16 (high, t=950)", pipe_pred_high_bf16, train_pred_high_2, atol=1e-4)
@@ -238,14 +242,18 @@ def main():
 
         inp_p = torch.cat([noisy_cpu.to(DEV_P), pipe_condition], dim=1)
         pipe_pred_low_bf16 = pipe.transformer_2(
-            hidden_states=inp_p, timestep=ts.to(DEV_P),
-            encoder_hidden_states=pipe_embeds, return_dict=False,
+            hidden_states=inp_p,
+            timestep=ts.to(DEV_P),
+            encoder_hidden_states=pipe_embeds,
+            return_dict=False,
         )[0]
 
         inp_t = torch.cat([noisy_cpu.to(DEV_T), train_condition], dim=1)
         train_pred_low_2 = train.transformer_2(
-            hidden_states=inp_t, timestep=ts.to(DEV_T),
-            encoder_hidden_states=train_embeds, return_dict=False,
+            hidden_states=inp_t,
+            timestep=ts.to(DEV_T),
+            encoder_hidden_states=train_embeds,
+            return_dict=False,
         )[0]
 
         ok = check("transformer_2 bf16 (low, t=400)", pipe_pred_low_bf16, train_pred_low_2, atol=1e-4)
