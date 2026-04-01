@@ -42,6 +42,8 @@ class I2VDataset(Dataset):
         json_path: str,
         num_frames: int = 81,
         max_area: int = 480 * 832,
+        height: int | None = None,
+        width: int | None = None,
         fps: int = 16,
     ):
         json_path_converted = Path(json_path)
@@ -49,6 +51,8 @@ class I2VDataset(Dataset):
         self.data = json.loads(json_path_converted.read_text())
         self.num_frames = num_frames
         self.max_area = max_area
+        self.fixed_height = height
+        self.fixed_width = width
         self.fps = fps
 
     def __len__(self):
@@ -62,7 +66,9 @@ class I2VDataset(Dataset):
         return str(self.base_dir / p)
 
     def _get_video_hw(self, video_path: str) -> tuple[int, int]:
-        """Probe original resolution and compute target (height, width)."""
+        """Return target (height, width). Uses fixed h/w if set, otherwise derives from video aspect ratio."""
+        if self.fixed_height is not None and self.fixed_width is not None:
+            return self.fixed_height, self.fixed_width
         vr = decord.VideoReader(video_path)
         orig_h, orig_w = vr[0].shape[:2]
         return compute_hw(self.max_area, orig_h / orig_w)
@@ -88,7 +94,7 @@ class I2VDataset(Dataset):
         """Load a single image as uint8. Returns (C, H, W)."""
         with Image.open(path) as img:
             img = img.convert("RGB").resize((width, height), Image.LANCZOS)
-            array = np.asarray(img, dtype=np.uint8)
+            array = np.array(img, dtype=np.uint8)
         return torch.from_numpy(array).permute(2, 0, 1).contiguous()
 
     def __getitem__(self, idx):

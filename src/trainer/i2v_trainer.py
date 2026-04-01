@@ -2,7 +2,6 @@
 
 import math
 import os
-from collections import deque
 from pathlib import Path
 
 import torch
@@ -175,6 +174,8 @@ class I2VTrainer:
             json_path=cfg.dataset_json,
             num_frames=cfg.num_frames,
             max_area=cfg.max_area,
+            height=cfg.height,
+            width=cfg.width,
             fps=cfg.fps,
         )
         dataset = raw_dataset
@@ -343,12 +344,15 @@ class I2VTrainer:
         seq_len = 0
         for prob, t in experts:
             t_cfg = t.config
-            # Estimate seq_len from max_area (assume square for MFU estimate)
-            approx_side = int(self.cfg.max_area**0.5)
+            # Estimate seq_len: use fixed h/w if set, otherwise approximate from max_area
+            if self.cfg.height is not None and self.cfg.width is not None:
+                est_h, est_w = self.cfg.height, self.cfg.width
+            else:
+                est_h = est_w = int(self.cfg.max_area**0.5)
             seq_len = compute_wan_seq_len(
                 self.cfg.num_frames,
-                approx_side,
-                approx_side,
+                est_h,
+                est_w,
                 patch_size=tuple(t_cfg.patch_size),
                 vae_temporal_factor=self.model.vae_scale_factor_temporal,
                 vae_spatial_factor=self.model.vae_scale_factor_spatial,
@@ -392,59 +396,6 @@ class I2VTrainer:
         # so skipping reproduces the exact same data sequence.
         resume_batch_idx = self.train_state.batch_idx
 
-        if self.rank == 0:
-            from rich.console import Console
-            from rich.live import Live
-            from rich.progress import (
-                BarColumn,
-                MofNCompleteColumn,
-                Progress,
-                SpinnerColumn,
-                TextColumn,
-                TimeElapsedColumn,
-                TimeRemainingColumn,
-            )
-            from rich.table import Table as RichTable
-
-            def build_metrics_table(rows):
-                table = RichTable(show_header=True, expand=True, box=None, padding=(0, 1))
-                table.add_column("step", style="bold")
-                table.add_column("epoch", style="blue")
-                table.add_column("loss", style="yellow")
-                table.add_column("lr", style="cyan")
-                table.add_column("grad_norm")
-                table.add_column("mfu", style="green")
-                for row in rows:
-                    table.add_row(*row)
-                return table
-
-            console = Console()
-            progress = Progress(
-                SpinnerColumn(),
-                TextColumn("[bold blue]Training"),
-                BarColumn(bar_width=None),
-                MofNCompleteColumn(),
-                TextColumn("•"),
-                TimeElapsedColumn(),
-                TextColumn("<"),
-                TimeRemainingColumn(),
-                console=console,
-                expand=True,
-            )
-            task_id = progress.add_task("Training", total=self.total_steps, completed=global_step)
-
-            # Metrics table (rendered below progress bar, keep only the latest rows)
-            metrics_rows = deque(maxlen=5)
-            metrics_table = build_metrics_table(metrics_rows)
-
-            from rich.console import Group
-
-            live = Live(Group(progress, metrics_table), console=console, refresh_per_second=10)
-            live.start()
-        else:
-            progress = None
-            live = None
-
         for epoch in range(start_epoch, cfg.num_epochs):
             self.sampler.set_epoch(epoch)
             for opt in self.optimizers:
@@ -478,20 +429,17 @@ class I2VTrainer:
 
                     if self.rank == 0 and global_step % cfg.log_steps == 0:
                         mfu = self.mfu_monitor.flush() if self.mfu_monitor is not None else None
-                        progress.update(task_id, completed=global_step)
-
-                        metrics_rows.append(
-                            (
-                                str(global_step),
-                                str(epoch),
-                                f"{loss.item():.4f}",
-                                f"{lr:.2e}",
-                                f"{self._last_grad_norm:.4f}",
-                                f"{mfu:.1%}" if mfu is not None else "-",
-                            )
+                        mfu_str = f"{mfu:.1%}" if mfu is not None else "-"
+                        logger.info(
+                            "step={}/{} epoch={} loss={:.4f} lr={:.2e} grad_norm={:.4f} mfu={}",
+                            global_step,
+                            self.total_steps,
+                            epoch,
+                            loss.item(),
+                            lr,
+                            self._last_grad_norm,
+                            mfu_str,
                         )
-                        metrics_table = build_metrics_table(metrics_rows)
-                        live.update(Group(progress, metrics_table), refresh=True)
 
                         if self.use_wandb:
                             import wandb
@@ -505,8 +453,6 @@ class I2VTrainer:
                             if mfu is not None:
                                 log_metrics["train/mfu"] = mfu
                             wandb.log(log_metrics, step=global_step)
-                    elif progress is not None:
-                        progress.update(task_id, completed=global_step)
 
                     if cfg.save_steps > 0 and global_step % cfg.save_steps == 0:
                         self.train_state.step = global_step
@@ -520,9 +466,6 @@ class I2VTrainer:
             self.train_state.batch_idx = 0
             self._save_checkpoint(output_dir / f"checkpoint-epoch{epoch}")
             logger.info("Epoch {} done.", epoch)
-
-        if live is not None:
-            live.stop()
 
         if self.use_wandb:
             import wandb
@@ -562,7 +505,7 @@ class I2VTrainer:
             # checkpoint-{step} or checkpoint-epoch{epoch}
             if name.startswith("checkpoint-epoch"):
                 try:
-                    epoch = int(name.removeprefix("checkpoint-epoch"))
+                    int(name.removeprefix("checkpoint-epoch"))  # validate format
                     # Use epoch * large number so epoch checkpoints sort after step ones
                     # only when there's no step checkpoint with a higher number.
                     # In practice, epoch checkpoints are saved after all step checkpoints

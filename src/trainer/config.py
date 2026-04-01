@@ -13,6 +13,8 @@ class TrainConfig(BaseModel):
     dataset_json: str = "data/train.json"
     num_frames: int = 81
     max_area: int = 480 * 832  # height * width budget; actual h/w derived per-video
+    height: int | None = None  # fixed height; overrides max_area when both h/w set
+    width: int | None = None  # fixed width; overrides max_area when both h/w set
     fps: int = 16
     num_workers: int = 4
     persistent_workers: bool = True
