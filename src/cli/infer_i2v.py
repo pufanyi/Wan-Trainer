@@ -41,6 +41,13 @@ def parse_args():
     parser.add_argument("--num_inference_steps", type=int, default=40, help="Number of inference steps")
     parser.add_argument("--fps", type=int, default=16, help="Output video FPS")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Path to a DCP training checkpoint directory to load (overrides transformer weights)",
+    )
+    parser.add_argument("--use_ema", action="store_true", help="Load EMA shadow weights from DCP checkpoint")
     return parser.parse_args()
 
 
@@ -52,6 +59,13 @@ def main():
 
     print(f"Loading model from {args.model_path} ...")
     pipe = WanImageToVideoPipeline.from_pretrained(args.model_path, torch_dtype=dtype)
+
+    if args.checkpoint:
+        from src.trainer.checkpoint import load_dcp_into_pipeline
+
+        print(f"Loading DCP checkpoint from {args.checkpoint} (ema={args.use_ema}) ...")
+        load_dcp_into_pipeline(pipe, args.checkpoint, use_ema=args.use_ema)
+
     pipe.to(device)
 
     print(f"Loading image from {args.image} ...")
