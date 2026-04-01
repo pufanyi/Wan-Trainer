@@ -10,7 +10,8 @@ import torch.distributed.checkpoint as dcp
 from loguru import logger
 from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.device_mesh import init_device_mesh
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DistributedSampler
+from torchdata.stateful_dataloader import StatefulDataLoader
 
 from src.data.i2v_dataset import I2VDataset
 from src.models.wan_i2v import LoRATrainConfig, WanI2VForTraining
@@ -77,8 +78,8 @@ class I2VTrainer:
             self._compile_modules(cfg)
 
         # ---- Dataset / DataLoader ----
-        dataset, self.sampler = self._build_dataset(cfg)
-        self.dataloader = self._build_dataloader(dataset, cfg)
+        self.dataset, self.sampler = self._build_dataset(cfg)
+        self.dataloader = self._build_dataloader(self.dataset, cfg)
 
         # ---- Optimizer ----
         self.params, self.optimizers, self.optimizer_te, self.optimizer_1, self.optimizer_2 = (
@@ -88,7 +89,7 @@ class I2VTrainer:
         self.total_steps = cfg.num_epochs * len(self.dataloader) // cfg.gradient_accumulation_steps
         logger.info(
             "Dataset: {} samples, {} batches/epoch, {} total optimizer steps",
-            len(dataset),
+            len(self.dataset),
             len(self.dataloader),
             self.total_steps,
         )
@@ -201,7 +202,7 @@ class I2VTrainer:
         sampler = DistributedSampler(dataset, num_replicas=self.world_size, rank=self.rank, shuffle=True, seed=cfg.seed)
         return dataset, sampler
 
-    def _build_dataloader(self, dataset, cfg: TrainConfig) -> DataLoader:
+    def _build_dataloader(self, dataset, cfg: TrainConfig) -> StatefulDataLoader:
         kwargs = dict(
             dataset=dataset,
             batch_size=cfg.batch_size,
@@ -214,7 +215,7 @@ class I2VTrainer:
         if cfg.num_workers > 0:
             kwargs["persistent_workers"] = cfg.persistent_workers
             kwargs["prefetch_factor"] = cfg.prefetch_factor
-        return DataLoader(**kwargs)
+        return StatefulDataLoader(**kwargs)
 
     def _build_optimizers(self, cfg: TrainConfig):
         optimizer_te = None
@@ -269,17 +270,19 @@ class I2VTrainer:
             prob = (N - bi) / N if self.cfg.train_experts == "both" else 1.0
             experts.append((prob, self.model.transformer_2))
 
-        if self.cfg.height is not None and self.cfg.width is not None:
-            est_h, est_w = self.cfg.height, self.cfg.width
+        # Use the first item's config as a representative estimate for MFU.
+        est_cfg = self.dataset._item_configs[0]
+        if est_cfg.fixed_height is not None and est_cfg.fixed_width is not None:
+            est_h, est_w = est_cfg.fixed_height, est_cfg.fixed_width
         else:
-            est_h = est_w = int(self.cfg.max_area**0.5)
+            est_h = est_w = int(est_cfg.max_area**0.5)
 
         weighted_fwd_flops = 0.0
         seq_len = 0
         for prob, t in experts:
             t_cfg = t.config
             seq_len = compute_wan_seq_len(
-                self.cfg.num_frames,
+                est_cfg.num_frames,
                 est_h,
                 est_w,
                 patch_size=tuple(t_cfg.patch_size),
@@ -318,7 +321,6 @@ class I2VTrainer:
 
         global_step = self.train_state.step
         start_epoch = self.train_state.epoch
-        resume_batch_idx = self.train_state.batch_idx
         train_start_time = time.monotonic()
         train_start_step = global_step
 
@@ -328,10 +330,6 @@ class I2VTrainer:
                 opt.zero_grad(set_to_none=True)
 
             for batch_idx, batch in enumerate(self.dataloader):
-                if batch_idx < resume_batch_idx:
-                    continue
-                resume_batch_idx = 0
-
                 is_last_micro_step = (batch_idx + 1) % cfg.gradient_accumulation_steps == 0
                 self._set_requires_gradient_sync(is_last_micro_step)
                 loss = self._train_step(batch)
@@ -420,7 +418,7 @@ class I2VTrainer:
         video = to_model_pixels(batch["video"], self.device)
         image = to_model_pixels(batch["image"], self.device)
         video_latents = self.model.encode_video(video)
-        condition = self.model.prepare_condition(image, self.cfg.num_frames, video.shape[-2], video.shape[-1])
+        condition = self.model.prepare_condition(image, video.shape[2], video.shape[-2], video.shape[-1])
         return self.model.compute_loss(video_latents, condition, prompt_embeds)
 
     def _set_requires_gradient_sync(self, requires_gradient_sync: bool) -> None:
@@ -467,6 +465,8 @@ class I2VTrainer:
         if self.ema is not None:
             state["ema"] = self.ema
         dcp.save(state, checkpoint_id=str(path))
+        # Save dataloader state separately (plain Python objects, not suited for DCP)
+        torch.save(self.dataloader.state_dict(), path / f"dataloader_rank{self.rank}.pt")
         if self.rank == 0 and self.model.lora_config is not None:
             self.model.save_lora(str(path / "lora"))
         if self.rank == 0:
@@ -491,6 +491,11 @@ class I2VTrainer:
         if self.ema is not None and "ema" not in state:
             self.ema.reinitialize()
             logger.warning("EMA not in DCP checkpoint, reinitialized from loaded model weights")
+        # Restore dataloader state for efficient resume (skip without re-iterating)
+        dl_state_path = Path(path) / f"dataloader_rank{self.rank}.pt"
+        if dl_state_path.exists():
+            self.dataloader.load_state_dict(torch.load(dl_state_path, weights_only=False))
+            logger.info("Restored dataloader state from {}", dl_state_path)
         logger.info(
             "Resumed at step={} epoch={} batch_idx={}",
             self.train_state.step,

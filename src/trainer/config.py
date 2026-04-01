@@ -11,11 +11,11 @@ class TrainConfig(BaseModel):
 
     # Data
     dataset_json: str = "data/train.json"
-    num_frames: int = 81
-    max_area: int = 480 * 832  # height * width budget; actual h/w derived per-video
-    height: int | None = None  # fixed height; overrides max_area when both h/w set
-    width: int | None = None  # fixed width; overrides max_area when both h/w set
-    fps: int = 16
+    num_frames: int | None = None  # override dataset JSON config; default 81
+    max_area: int | None = None  # override dataset JSON config; default 480*832
+    height: int | None = None  # override dataset JSON config; fixed height
+    width: int | None = None  # override dataset JSON config; fixed width
+    fps: int | None = None  # override dataset JSON config; default 16
     num_workers: int = 4
     persistent_workers: bool = True
     prefetch_factor: int = 2
