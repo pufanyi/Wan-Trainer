@@ -12,8 +12,7 @@ class TrainConfig(BaseModel):
     # Data
     dataset_json: str = "data/train.json"
     num_frames: int = 81
-    height: int = 480
-    width: int = 832
+    max_area: int = 480 * 832  # height * width budget; actual h/w derived per-video
     fps: int = 16
     num_workers: int = 4
     persistent_workers: bool = True
@@ -54,6 +53,7 @@ class TrainConfig(BaseModel):
 
     # Checkpoint
     resume_from: str | None = None
+    auto_resume: bool = True  # auto-detect latest checkpoint in output_dir
 
     # Logging
     wandb_project: str | None = None

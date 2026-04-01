@@ -174,8 +174,7 @@ class I2VTrainer:
         raw_dataset = I2VDataset(
             json_path=cfg.dataset_json,
             num_frames=cfg.num_frames,
-            height=cfg.height,
-            width=cfg.width,
+            max_area=cfg.max_area,
             fps=cfg.fps,
         )
         dataset = raw_dataset
@@ -315,8 +314,9 @@ class I2VTrainer:
             )
 
         # ---- Resume ----
-        if cfg.resume_from:
-            self._load_checkpoint(cfg.resume_from)
+        resume_path = cfg.resume_from or (self._find_latest_checkpoint() if cfg.auto_resume else None)
+        if resume_path:
+            self._load_checkpoint(resume_path)
 
     # ------------------------------------------------------------------
     # MFU setup
@@ -343,10 +343,12 @@ class I2VTrainer:
         seq_len = 0
         for prob, t in experts:
             t_cfg = t.config
+            # Estimate seq_len from max_area (assume square for MFU estimate)
+            approx_side = int(self.cfg.max_area**0.5)
             seq_len = compute_wan_seq_len(
                 self.cfg.num_frames,
-                self.cfg.height,
-                self.cfg.width,
+                approx_side,
+                approx_side,
                 patch_size=tuple(t_cfg.patch_size),
                 vae_temporal_factor=self.model.vae_scale_factor_temporal,
                 vae_spatial_factor=self.model.vae_scale_factor_spatial,
@@ -534,7 +536,7 @@ class I2VTrainer:
         video = _to_model_pixels(batch["video"], self.device)  # (B, C, T, H, W)
         image = _to_model_pixels(batch["image"], self.device)  # (B, C, H, W)
         video_latents = self.model.encode_video(video)
-        condition = self.model.prepare_condition(image, self.cfg.num_frames, self.cfg.height, self.cfg.width)
+        condition = self.model.prepare_condition(image, self.cfg.num_frames, video.shape[-2], video.shape[-1])
 
         return self.model.compute_loss(video_latents, condition, prompt_embeds)
 
@@ -546,6 +548,40 @@ class I2VTrainer:
     # ------------------------------------------------------------------
     # DCP checkpointing
     # ------------------------------------------------------------------
+
+    def _find_latest_checkpoint(self) -> str | None:
+        """Scan output_dir for the latest valid DCP checkpoint (contains .metadata)."""
+        output_dir = Path(self.cfg.output_dir)
+        if not output_dir.exists():
+            return None
+        candidates: list[tuple[int, Path]] = []
+        for d in output_dir.iterdir():
+            if not d.is_dir() or not (d / ".metadata").exists():
+                continue
+            name = d.name
+            # checkpoint-{step} or checkpoint-epoch{epoch}
+            if name.startswith("checkpoint-epoch"):
+                try:
+                    epoch = int(name.removeprefix("checkpoint-epoch"))
+                    # Use epoch * large number so epoch checkpoints sort after step ones
+                    # only when there's no step checkpoint with a higher number.
+                    # In practice, epoch checkpoints are saved after all step checkpoints
+                    # in that epoch, so we use mtime as tiebreaker.
+                    candidates.append((int(d.stat().st_mtime_ns), d))
+                except ValueError:
+                    continue
+            elif name.startswith("checkpoint-"):
+                try:
+                    int(name.removeprefix("checkpoint-"))
+                    candidates.append((int(d.stat().st_mtime_ns), d))
+                except ValueError:
+                    continue
+        if not candidates:
+            return None
+        candidates.sort()
+        latest = candidates[-1][1]
+        logger.info("Auto-resume: found checkpoint {}", latest)
+        return str(latest)
 
     def _save_checkpoint(self, path: Path):
         """Save with DCP. All ranks participate; each writes its own shards."""
