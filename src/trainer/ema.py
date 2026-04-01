@@ -1,28 +1,44 @@
-"""Exponential Moving Average for FSDP2 training."""
+"""Exponential Moving Average for FSDP2 training with DCP support."""
 
 import torch
+from torch.distributed.checkpoint.stateful import Stateful
 
 
-class EMA:
+class EMA(Stateful):
     """Exponential Moving Average of model parameters.
 
-    Works with FSDP2: each rank maintains EMA of its local parameter shards.
-    Does not support resharding (changing world_size on resume).
+    Works with FSDP2: each rank maintains EMA of its local parameter shards
+    as DTensors, enabling DCP save/load with automatic resharding support.
     """
 
-    def __init__(self, params: list[torch.nn.Parameter], decay: float):
+    def __init__(self, models: dict[str, torch.nn.Module], decay: float):
         self.decay = decay
-        self.params = params
-        self.shadow = [p.data.clone() for p in params]
+        self.shadow: dict[str, torch.Tensor] = {}
+        self._pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for model_name, model in models.items():
+            for pname, p in model.named_parameters():
+                if p.requires_grad:
+                    s = p.data.clone()
+                    self.shadow[f"{model_name}.{pname}"] = s
+                    self._pairs.append((p, s))
 
     @torch.no_grad()
     def update(self):
-        for s, p in zip(self.shadow, self.params, strict=True):
+        for p, s in self._pairs:
             s.lerp_(p.data, 1 - self.decay)
 
-    def state_dict(self) -> list[torch.Tensor]:
-        return [s.clone() for s in self.shadow]
+    def reinitialize(self):
+        """Reset shadow parameters to current model weights."""
+        for p, s in self._pairs:
+            s.copy_(p.data)
 
-    def load_state_dict(self, state: list[torch.Tensor]):
-        for s, loaded in zip(self.shadow, state, strict=True):
-            s.copy_(loaded)
+    def state_dict(self) -> dict:
+        return {"shadow": self.shadow, "decay": self.decay}
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        loaded_shadow = state_dict["shadow"]
+        for key, s in self.shadow.items():
+            if key in loaded_shadow:
+                s.copy_(loaded_shadow[key])
+        if "decay" in state_dict:
+            self.decay = state_dict["decay"]

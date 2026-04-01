@@ -75,8 +75,15 @@ class I2VTrainer:
         # ---- EMA ----
         self.ema = None
         if cfg.ema_decay > 0:
-            self.ema = EMA(self.params, decay=cfg.ema_decay)
-            logger.info("EMA enabled (decay={}, {} shadow params)", cfg.ema_decay, len(self.params))
+            ema_models: dict[str, torch.nn.Module] = {}
+            if cfg.train_text_encoder:
+                ema_models["text_encoder"] = self.model.text_encoder
+            if self.model.transformer is not None:
+                ema_models["transformer"] = self.model.transformer
+            if self.model.transformer_2 is not None:
+                ema_models["transformer_2"] = self.model.transformer_2
+            self.ema = EMA(ema_models, decay=cfg.ema_decay)
+            logger.info("EMA enabled (decay={}, {} shadow params)", cfg.ema_decay, len(self.ema.shadow))
 
         self.total_steps = cfg.num_epochs * len(self.dataloader) // cfg.gradient_accumulation_steps
         logger.info(
@@ -456,14 +463,10 @@ class I2VTrainer:
 
     def _save_checkpoint(self, path: Path):
         """Save with DCP. All ranks participate; each writes its own shards."""
-        dcp.save({"train_state": self.train_state}, checkpoint_id=str(path))
+        state: dict = {"train_state": self.train_state}
         if self.ema is not None:
-            ema_dir = path / "ema"
-            ema_dir.mkdir(exist_ok=True)
-            ema_file = ema_dir / f"rank{self.rank}.pt"
-            ema_tmp = ema_file.with_suffix(".pt.tmp")
-            torch.save(self.ema.state_dict(), ema_tmp)
-            ema_tmp.rename(ema_file)
+            state["ema"] = self.ema
+        dcp.save(state, checkpoint_id=str(path))
         if self.rank == 0 and self.model.lora_config is not None:
             self.model.save_lora(str(path / "lora"))
         if self.rank == 0:
@@ -473,15 +476,21 @@ class I2VTrainer:
     def _load_checkpoint(self, path: str):
         """Load with DCP. Supports resharding across different world sizes."""
         logger.info("Resuming from {} ...", path)
-        dcp.load({"train_state": self.train_state}, checkpoint_id=path)
-        if self.ema is not None:
-            ema_file = Path(path) / "ema" / f"rank{self.rank}.pt"
-            if ema_file.exists():
-                try:
-                    self.ema.load_state_dict(torch.load(ema_file, map_location=self.device, weights_only=True))
-                    logger.info("Loaded EMA state from {}", ema_file)
-                except RuntimeError as e:
-                    logger.warning("Failed to load EMA state from {} ({}), skipping EMA restore", ema_file, e)
+        state: dict = {"train_state": self.train_state}
+        has_legacy_ema = (Path(path) / "ema").is_dir()
+        if self.ema is not None and not has_legacy_ema:
+            state["ema"] = self.ema
+        try:
+            dcp.load(state, checkpoint_id=path)
+        except Exception:
+            if "ema" in state:
+                logger.warning("Failed to load EMA from DCP, retrying without EMA")
+                dcp.load({"train_state": self.train_state}, checkpoint_id=path)
+            else:
+                raise
+        if self.ema is not None and "ema" not in state:
+            self.ema.reinitialize()
+            logger.warning("EMA not in DCP checkpoint, reinitialized from loaded model weights")
         logger.info(
             "Resumed at step={} epoch={} batch_idx={}",
             self.train_state.step,
