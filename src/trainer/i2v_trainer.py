@@ -1,7 +1,7 @@
 """Wan2.2 I2V Trainer with FSDP2 + Distributed Checkpoint (DCP)."""
 
-import math
 import os
+import time
 from pathlib import Path
 
 import torch
@@ -16,116 +16,24 @@ from src.data.i2v_dataset import I2VDataset
 from src.models.wan_i2v import LoRATrainConfig, WanI2VForTraining
 from src.trainer.checkpoint import TrainState
 from src.trainer.config import TrainConfig
+from src.trainer.ema import EMA
 from src.trainer.flops import MFUMonitor, compute_wan_seq_len, estimate_wan_forward_flops, get_gpu_peak_flops_bf16
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+from src.trainer.utils import collate, cosine_lr, setup_loguru, shard_transformer, to_model_pixels
 
 
-def _cosine_lr(step: int, warmup: int, total: int, base_lr: float) -> float:
-    """Linear warmup + cosine decay."""
-    if step < warmup:
-        return base_lr * step / max(warmup, 1)
-    progress = (step - warmup) / max(total - warmup, 1)
-    return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
-
-
-def _collate(batch):
-    collated = {}
-    sample = batch[0]
-    for key, value in sample.items():
-        if isinstance(value, torch.Tensor):
-            collated[key] = torch.stack([x[key] for x in batch])
-    if "prompt" in sample:
-        collated["prompt"] = [x["prompt"] for x in batch]
-    if "index" in sample:
-        collated["index"] = torch.tensor([x["index"] for x in batch], dtype=torch.long)
-    return collated
-
-
-def _to_model_pixels(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """Move uint8 pixels to GPU and normalize to [-1, 1] in bf16."""
-    return tensor.to(device=device, dtype=torch.bfloat16, non_blocking=True).div(127.5).sub(1.0)
-
-
-def _shard_transformer(module, mesh, mp_policy):
-    """Apply FSDP2 fully_shard per-block then top-level."""
-    for block in module.blocks:
-        fully_shard(block, mesh=mesh, mp_policy=mp_policy)
-    fully_shard(module, mesh=mesh, mp_policy=mp_policy)
-
-
-def _setup_loguru(rank: int) -> None:
-    """Configure loguru: Rich sink on rank 0, silence other ranks."""
-    from rich.console import Console
-    from rich.text import Text
-
-    logger.remove()
-    if rank == 0:
-        console = Console(stderr=True)
-
-        _LEVEL_STYLES = {
-            "DEBUG": "dim cyan",
-            "INFO": "bold green",
-            "SUCCESS": "bold green",
-            "WARNING": "bold yellow",
-            "ERROR": "bold red",
-            "CRITICAL": "bold white on red",
-        }
-
-        def _rich_sink(message):
-            record = message.record
-            level = record["level"].name
-            style = _LEVEL_STYLES.get(level, "")
-            ts = record["time"].strftime("%H:%M:%S")
-
-            line = Text()
-            line.append(ts, style="dim")
-            line.append(" | ", style="dim")
-            line.append(f"{level:<8}", style=style)
-            line.append(" | ", style="dim")
-            line.append(str(record["message"]))
-            console.print(line)
-
-        logger.add(_rich_sink, level="INFO")
-    else:
-        logger.disable("src")
-
-
-# ---------------------------------------------------------------------------
-# EMA
-# ---------------------------------------------------------------------------
-
-
-class EMA:
-    """Exponential Moving Average of model parameters.
-
-    Works with FSDP2: each rank maintains EMA of its local parameter shards.
-    Does not support resharding (changing world_size on resume).
-    """
-
-    def __init__(self, params: list[torch.nn.Parameter], decay: float):
-        self.decay = decay
-        self.params = params
-        self.shadow = [p.data.clone() for p in params]
-
-    @torch.no_grad()
-    def update(self):
-        for s, p in zip(self.shadow, self.params, strict=True):
-            s.lerp_(p.data, 1 - self.decay)
-
-    def state_dict(self) -> list[torch.Tensor]:
-        return [s.clone() for s in self.shadow]
-
-    def load_state_dict(self, state: list[torch.Tensor]):
-        for s, loaded in zip(self.shadow, state, strict=True):
-            s.copy_(loaded)
-
-
-# ---------------------------------------------------------------------------
-# Trainer
-# ---------------------------------------------------------------------------
+def _format_eta(seconds: float) -> str:
+    """Format seconds into a human-readable ETA string."""
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    if h < 24:
+        return f"{h}h{m:02d}m"
+    d, h = divmod(h, 24)
+    return f"{d}d{h:02d}h"
 
 
 class I2VTrainer:
@@ -141,138 +49,27 @@ class I2VTrainer:
         torch.cuda.set_device(self.device)
         torch.manual_seed(cfg.seed + self.rank)
 
-        _setup_loguru(self.rank)
+        setup_loguru(self.rank)
 
         logger.info("World size: {}", self.world_size)
 
         # ---- Model ----
-        lora_cfg = (
-            LoRATrainConfig(rank=cfg.lora_rank, lora_alpha=cfg.lora_alpha, lora_dropout=cfg.lora_dropout)
-            if cfg.lora_rank > 0
-            else None
-        )
-        logger.info(
-            "Loading model from {} (lora_rank={}, experts={}) ...",
-            cfg.model_path,
-            cfg.lora_rank,
-            cfg.train_experts,
-        )
-        self.model = WanI2VForTraining(
-            cfg.model_path,
-            lora_config=lora_cfg,
-            train_experts=cfg.train_experts,
-            train_text_encoder=cfg.train_text_encoder,
-            gradient_checkpointing=cfg.gradient_checkpointing,
-        )
+        self.model = self._build_model(cfg)
 
-        # Move frozen parts to GPU
-        self.model.text_encoder.to(self.device)
-        self.model.vae.to(self.device)
+        # ---- FSDP2 ----
+        self.sync_modules = self._setup_fsdp(cfg)
 
-        # ---- Dataset / cache ----
-        raw_dataset = I2VDataset(
-            json_path=cfg.dataset_json,
-            num_frames=cfg.num_frames,
-            max_area=cfg.max_area,
-            height=cfg.height,
-            width=cfg.width,
-            fps=cfg.fps,
-        )
-        dataset = raw_dataset
-
-        # FSDP2 shard trainable modules
-        mesh = init_device_mesh("cuda", (self.world_size,))
-        dtype_map = {"bfloat16": torch.bfloat16, "float32": torch.float32}
-        mp_policy = MixedPrecisionPolicy(
-            param_dtype=dtype_map[cfg.param_dtype],
-            reduce_dtype=dtype_map[cfg.reduce_dtype],
-        )
-        if cfg.train_text_encoder:
-            fully_shard(self.model.text_encoder, mesh=mesh, mp_policy=mp_policy)
-        if self.model.transformer is not None:
-            _shard_transformer(self.model.transformer, mesh, mp_policy)
-        if self.model.transformer_2 is not None:
-            _shard_transformer(self.model.transformer_2, mesh, mp_policy)
-        self.sync_modules = [
-            module
-            for module in [
-                self.model.text_encoder if cfg.train_text_encoder else None,
-                self.model.transformer,
-                self.model.transformer_2,
-            ]
-            if module is not None
-        ]
-
-        # ---- torch.compile (after FSDP sharding) ----
+        # ---- torch.compile ----
         if cfg.torch_compile:
-            compile_kwargs = {"backend": cfg.torch_compile_backend}
-            if cfg.torch_compile_mode is not None:
-                compile_kwargs["mode"] = cfg.torch_compile_mode
-            # Frozen modules (inference-only, static shapes)
-            self.model.vae = torch.compile(self.model.vae, **compile_kwargs)
-            logger.info("Compiled vae")
-            if not cfg.train_text_encoder:
-                self.model.text_encoder = torch.compile(self.model.text_encoder, **compile_kwargs)
-                logger.info("Compiled text_encoder")
-            # Trainable transformers
-            if self.model.transformer is not None:
-                self.model.transformer = torch.compile(self.model.transformer, **compile_kwargs)
-                logger.info("Compiled transformer")
-            if self.model.transformer_2 is not None:
-                self.model.transformer_2 = torch.compile(self.model.transformer_2, **compile_kwargs)
-                logger.info("Compiled transformer_2")
-            logger.info(
-                "torch.compile enabled (backend={}, mode={})", cfg.torch_compile_backend, cfg.torch_compile_mode
-            )
+            self._compile_modules(cfg)
 
-        sampler = DistributedSampler(dataset, num_replicas=self.world_size, rank=self.rank, shuffle=True, seed=cfg.seed)
-        dataloader_kwargs = dict(
-            dataset=dataset,
-            batch_size=cfg.batch_size,
-            sampler=sampler,
-            num_workers=cfg.num_workers,
-            pin_memory=True,
-            collate_fn=_collate,
-            drop_last=True,
-        )
-        if cfg.num_workers > 0:
-            dataloader_kwargs["persistent_workers"] = cfg.persistent_workers
-            dataloader_kwargs["prefetch_factor"] = cfg.prefetch_factor
-        self.dataloader = DataLoader(**dataloader_kwargs)
-        self.sampler = sampler
+        # ---- Dataset / DataLoader ----
+        dataset, self.sampler = self._build_dataset(cfg)
+        self.dataloader = self._build_dataloader(dataset, cfg)
 
-        # ---- Optimizer (one per FSDP module for correct DCP state_dict mapping) ----
-        self.optimizer_te = None
-        self.optimizer_1 = None
-        self.optimizer_2 = None
-        self.params = []
-        total_params = 0
-        optim_kwargs = dict(lr=cfg.learning_rate, weight_decay=cfg.weight_decay, betas=(0.9, 0.999))
-
-        if cfg.train_text_encoder:
-            params_te = [p for p in self.model.text_encoder.parameters() if p.requires_grad]
-            self.params.extend(params_te)
-            total_params += sum(p.numel() for p in self.model.text_encoder.parameters())
-            self.optimizer_te = torch.optim.AdamW(params_te, **optim_kwargs)
-
-        if self.model.transformer is not None:
-            params_1 = [p for p in self.model.transformer.parameters() if p.requires_grad]
-            self.params.extend(params_1)
-            total_params += sum(p.numel() for p in self.model.transformer.parameters())
-            self.optimizer_1 = torch.optim.AdamW(params_1, **optim_kwargs)
-
-        if self.model.transformer_2 is not None:
-            params_2 = [p for p in self.model.transformer_2.parameters() if p.requires_grad]
-            self.params.extend(params_2)
-            total_params += sum(p.numel() for p in self.model.transformer_2.parameters())
-            self.optimizer_2 = torch.optim.AdamW(params_2, **optim_kwargs)
-
-        trainable_count = sum(p.numel() for p in self.params)
-        logger.info(
-            "Trainable: {:.1f}M / {:.1f}M ({:.2f}%)",
-            trainable_count / 1e6,
-            total_params / 1e6,
-            100 * trainable_count / total_params,
+        # ---- Optimizer ----
+        self.params, self.optimizers, self.optimizer_te, self.optimizer_1, self.optimizer_2 = (
+            self._build_optimizers(cfg)
         )
 
         # ---- EMA ----
@@ -290,7 +87,6 @@ class I2VTrainer:
         )
 
         # ---- DCP state ----
-        self.optimizers = [opt for opt in [self.optimizer_te, self.optimizer_1, self.optimizer_2] if opt is not None]
         self.train_state = TrainState(
             text_encoder=self.model.text_encoder if cfg.train_text_encoder else None,
             transformer=self.model.transformer,
@@ -320,8 +116,135 @@ class I2VTrainer:
             self._load_checkpoint(resume_path)
 
     # ------------------------------------------------------------------
-    # MFU setup
+    # Setup helpers
     # ------------------------------------------------------------------
+
+    def _build_model(self, cfg: TrainConfig) -> WanI2VForTraining:
+        lora_cfg = (
+            LoRATrainConfig(rank=cfg.lora_rank, lora_alpha=cfg.lora_alpha, lora_dropout=cfg.lora_dropout)
+            if cfg.lora_rank > 0
+            else None
+        )
+        logger.info(
+            "Loading model from {} (lora_rank={}, experts={}) ...",
+            cfg.model_path,
+            cfg.lora_rank,
+            cfg.train_experts,
+        )
+        model = WanI2VForTraining(
+            cfg.model_path,
+            lora_config=lora_cfg,
+            train_experts=cfg.train_experts,
+            train_text_encoder=cfg.train_text_encoder,
+            gradient_checkpointing=cfg.gradient_checkpointing,
+        )
+        model.text_encoder.to(self.device)
+        model.vae.to(self.device)
+        return model
+
+    def _setup_fsdp(self, cfg: TrainConfig) -> list[torch.nn.Module]:
+        mesh = init_device_mesh("cuda", (self.world_size,))
+        dtype_map = {"bfloat16": torch.bfloat16, "float32": torch.float32}
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=dtype_map[cfg.param_dtype],
+            reduce_dtype=dtype_map[cfg.reduce_dtype],
+        )
+        if cfg.train_text_encoder:
+            fully_shard(self.model.text_encoder, mesh=mesh, mp_policy=mp_policy)
+        if self.model.transformer is not None:
+            shard_transformer(self.model.transformer, mesh, mp_policy)
+        if self.model.transformer_2 is not None:
+            shard_transformer(self.model.transformer_2, mesh, mp_policy)
+        return [
+            m
+            for m in [
+                self.model.text_encoder if cfg.train_text_encoder else None,
+                self.model.transformer,
+                self.model.transformer_2,
+            ]
+            if m is not None
+        ]
+
+    def _compile_modules(self, cfg: TrainConfig) -> None:
+        compile_kwargs = {"backend": cfg.torch_compile_backend}
+        if cfg.torch_compile_mode is not None:
+            compile_kwargs["mode"] = cfg.torch_compile_mode
+        self.model.vae = torch.compile(self.model.vae, **compile_kwargs)
+        logger.info("Compiled vae")
+        if not cfg.train_text_encoder:
+            self.model.text_encoder = torch.compile(self.model.text_encoder, **compile_kwargs)
+            logger.info("Compiled text_encoder")
+        if self.model.transformer is not None:
+            self.model.transformer = torch.compile(self.model.transformer, **compile_kwargs)
+            logger.info("Compiled transformer")
+        if self.model.transformer_2 is not None:
+            self.model.transformer_2 = torch.compile(self.model.transformer_2, **compile_kwargs)
+            logger.info("Compiled transformer_2")
+        logger.info("torch.compile enabled (backend={}, mode={})", cfg.torch_compile_backend, cfg.torch_compile_mode)
+
+    def _build_dataset(self, cfg: TrainConfig) -> tuple:
+        dataset = I2VDataset(
+            json_path=cfg.dataset_json,
+            num_frames=cfg.num_frames,
+            max_area=cfg.max_area,
+            height=cfg.height,
+            width=cfg.width,
+            fps=cfg.fps,
+        )
+        sampler = DistributedSampler(dataset, num_replicas=self.world_size, rank=self.rank, shuffle=True, seed=cfg.seed)
+        return dataset, sampler
+
+    def _build_dataloader(self, dataset, cfg: TrainConfig) -> DataLoader:
+        kwargs = dict(
+            dataset=dataset,
+            batch_size=cfg.batch_size,
+            sampler=self.sampler,
+            num_workers=cfg.num_workers,
+            pin_memory=True,
+            collate_fn=collate,
+            drop_last=True,
+        )
+        if cfg.num_workers > 0:
+            kwargs["persistent_workers"] = cfg.persistent_workers
+            kwargs["prefetch_factor"] = cfg.prefetch_factor
+        return DataLoader(**kwargs)
+
+    def _build_optimizers(self, cfg: TrainConfig):
+        optimizer_te = None
+        optimizer_1 = None
+        optimizer_2 = None
+        params = []
+        total_params = 0
+        optim_kwargs = dict(lr=cfg.learning_rate, weight_decay=cfg.weight_decay, betas=(0.9, 0.999), fused=True)
+
+        if cfg.train_text_encoder:
+            params_te = [p for p in self.model.text_encoder.parameters() if p.requires_grad]
+            params.extend(params_te)
+            total_params += sum(p.numel() for p in self.model.text_encoder.parameters())
+            optimizer_te = torch.optim.AdamW(params_te, **optim_kwargs)
+
+        if self.model.transformer is not None:
+            params_1 = [p for p in self.model.transformer.parameters() if p.requires_grad]
+            params.extend(params_1)
+            total_params += sum(p.numel() for p in self.model.transformer.parameters())
+            optimizer_1 = torch.optim.AdamW(params_1, **optim_kwargs)
+
+        if self.model.transformer_2 is not None:
+            params_2 = [p for p in self.model.transformer_2.parameters() if p.requires_grad]
+            params.extend(params_2)
+            total_params += sum(p.numel() for p in self.model.transformer_2.parameters())
+            optimizer_2 = torch.optim.AdamW(params_2, **optim_kwargs)
+
+        trainable_count = sum(p.numel() for p in params)
+        logger.info(
+            "Trainable: {:.1f}M / {:.1f}M ({:.2f}%)",
+            trainable_count / 1e6,
+            total_params / 1e6,
+            100 * trainable_count / total_params,
+        )
+
+        optimizers = [opt for opt in [optimizer_te, optimizer_1, optimizer_2] if opt is not None]
+        return params, optimizers, optimizer_te, optimizer_1, optimizer_2
 
     def _setup_mfu(self) -> MFUMonitor | None:
         """Pre-compute FLOPs and create MFU monitor. Returns None if GPU is unrecognized."""
@@ -329,7 +252,6 @@ class I2VTrainer:
         if gpu_peak is None:
             return None
 
-        # Weighted forward FLOPs across active experts by routing probability
         bi = self.model.boundary_idx
         N = self.model.num_train_timesteps
         experts = []
@@ -340,15 +262,15 @@ class I2VTrainer:
             prob = (N - bi) / N if self.cfg.train_experts == "both" else 1.0
             experts.append((prob, self.model.transformer_2))
 
+        if self.cfg.height is not None and self.cfg.width is not None:
+            est_h, est_w = self.cfg.height, self.cfg.width
+        else:
+            est_h = est_w = int(self.cfg.max_area**0.5)
+
         weighted_fwd_flops = 0.0
         seq_len = 0
         for prob, t in experts:
             t_cfg = t.config
-            # Estimate seq_len: use fixed h/w if set, otherwise approximate from max_area
-            if self.cfg.height is not None and self.cfg.width is not None:
-                est_h, est_w = self.cfg.height, self.cfg.width
-            else:
-                est_h = est_w = int(self.cfg.max_area**0.5)
             seq_len = compute_wan_seq_len(
                 self.cfg.num_frames,
                 est_h,
@@ -366,7 +288,6 @@ class I2VTrainer:
             )
             weighted_fwd_flops += prob * fwd
 
-        # Training = forward(1x) + backward(2x) per sample, times micro-batches per optimizer step
         flops_per_step = 3 * weighted_fwd_flops * self.cfg.batch_size * self.cfg.gradient_accumulation_steps
 
         logger.info(
@@ -390,11 +311,9 @@ class I2VTrainer:
 
         global_step = self.train_state.step
         start_epoch = self.train_state.epoch
-
-        # On resume, skip batches already processed in the interrupted epoch.
-        # DistributedSampler with the same seed+epoch produces the same order,
-        # so skipping reproduces the exact same data sequence.
         resume_batch_idx = self.train_state.batch_idx
+        train_start_time = time.monotonic()
+        train_start_step = global_step
 
         for epoch in range(start_epoch, cfg.num_epochs):
             self.sampler.set_epoch(epoch)
@@ -403,8 +322,8 @@ class I2VTrainer:
 
             for batch_idx, batch in enumerate(self.dataloader):
                 if batch_idx < resume_batch_idx:
-                    continue  # skip already-processed batches
-                resume_batch_idx = 0  # only skip in the first (resumed) epoch
+                    continue
+                resume_batch_idx = 0
 
                 is_last_micro_step = (batch_idx + 1) % cfg.gradient_accumulation_steps == 0
                 self._set_requires_gradient_sync(is_last_micro_step)
@@ -415,7 +334,7 @@ class I2VTrainer:
                 if is_last_micro_step:
                     self._last_grad_norm = torch.nn.utils.clip_grad_norm_(self.params, cfg.max_grad_norm).item()
 
-                    lr = _cosine_lr(global_step, cfg.warmup_steps, self.total_steps, cfg.learning_rate)
+                    lr = cosine_lr(global_step, cfg.warmup_steps, self.total_steps, cfg.learning_rate)
                     for opt in self.optimizers:
                         for pg in opt.param_groups:
                             pg["lr"] = lr
@@ -430,8 +349,21 @@ class I2VTrainer:
                     if self.rank == 0 and global_step % cfg.log_steps == 0:
                         mfu = self.mfu_monitor.flush() if self.mfu_monitor is not None else None
                         mfu_str = f"{mfu:.1%}" if mfu is not None else "-"
+
+                        # ETA
+                        elapsed = time.monotonic() - train_start_time
+                        steps_done = global_step - train_start_step
+                        if steps_done > 0:
+                            secs_per_step = elapsed / steps_done
+                            eta_secs = secs_per_step * (self.total_steps - global_step)
+                            eta_str = _format_eta(eta_secs)
+                            it_s_str = f"{1 / secs_per_step:.2f}"
+                        else:
+                            eta_str = "?"
+                            it_s_str = "?"
+
                         logger.info(
-                            "step={}/{} epoch={} loss={:.4f} lr={:.2e} grad_norm={:.4f} mfu={}",
+                            "step={}/{} epoch={} loss={:.4f} lr={:.2e} grad_norm={:.4f} mfu={} eta={} ({} it/s)",
                             global_step,
                             self.total_steps,
                             epoch,
@@ -439,6 +371,8 @@ class I2VTrainer:
                             lr,
                             self._last_grad_norm,
                             mfu_str,
+                            eta_str,
+                            it_s_str,
                         )
 
                         if self.use_wandb:
@@ -460,7 +394,7 @@ class I2VTrainer:
                         self.train_state.batch_idx = batch_idx + 1
                         self._save_checkpoint(output_dir / f"checkpoint-{global_step}")
 
-            # End-of-epoch save (batch_idx=0 means start fresh next epoch)
+            # End-of-epoch save
             self.train_state.step = global_step
             self.train_state.epoch = epoch + 1
             self.train_state.batch_idx = 0
@@ -476,11 +410,10 @@ class I2VTrainer:
     def _train_step(self, batch: dict) -> torch.Tensor:
         """Single forward pass: encode frozen inputs, compute loss."""
         prompt_embeds = self.model.encode_text(batch["prompt"], self.device)
-        video = _to_model_pixels(batch["video"], self.device)  # (B, C, T, H, W)
-        image = _to_model_pixels(batch["image"], self.device)  # (B, C, H, W)
+        video = to_model_pixels(batch["video"], self.device)
+        image = to_model_pixels(batch["image"], self.device)
         video_latents = self.model.encode_video(video)
         condition = self.model.prepare_condition(image, self.cfg.num_frames, video.shape[-2], video.shape[-1])
-
         return self.model.compute_loss(video_latents, condition, prompt_embeds)
 
     def _set_requires_gradient_sync(self, requires_gradient_sync: bool) -> None:
@@ -502,14 +435,9 @@ class I2VTrainer:
             if not d.is_dir() or not (d / ".metadata").exists():
                 continue
             name = d.name
-            # checkpoint-{step} or checkpoint-epoch{epoch}
             if name.startswith("checkpoint-epoch"):
                 try:
                     int(name.removeprefix("checkpoint-epoch"))  # validate format
-                    # Use epoch * large number so epoch checkpoints sort after step ones
-                    # only when there's no step checkpoint with a higher number.
-                    # In practice, epoch checkpoints are saved after all step checkpoints
-                    # in that epoch, so we use mtime as tiebreaker.
                     candidates.append((int(d.stat().st_mtime_ns), d))
                 except ValueError:
                     continue
@@ -529,12 +457,10 @@ class I2VTrainer:
     def _save_checkpoint(self, path: Path):
         """Save with DCP. All ranks participate; each writes its own shards."""
         dcp.save({"train_state": self.train_state}, checkpoint_id=str(path))
-        # Save EMA shards (each rank saves its own; does not support resharding)
         if self.ema is not None:
             ema_dir = path / "ema"
             ema_dir.mkdir(exist_ok=True)
             torch.save(self.ema.state_dict(), ema_dir / f"rank{self.rank}.pt")
-        # Also save LoRA adapter weights in portable PEFT format (rank 0 only)
         if self.rank == 0 and self.model.lora_config is not None:
             self.model.save_lora(str(path / "lora"))
         if self.rank == 0:
