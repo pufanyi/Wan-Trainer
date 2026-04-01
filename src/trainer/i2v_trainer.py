@@ -59,6 +59,19 @@ class I2VTrainer:
         # ---- FSDP2 ----
         self.sync_modules = self._setup_fsdp(cfg)
 
+        # ---- EMA (before compile so shadow keys don't contain _orig_mod) ----
+        self.ema = None
+        if cfg.ema_decay > 0:
+            ema_models: dict[str, torch.nn.Module] = {}
+            if cfg.train_text_encoder:
+                ema_models["text_encoder"] = self.model.text_encoder
+            if self.model.transformer is not None:
+                ema_models["transformer"] = self.model.transformer
+            if self.model.transformer_2 is not None:
+                ema_models["transformer_2"] = self.model.transformer_2
+            self.ema = EMA(ema_models, decay=cfg.ema_decay)
+            logger.info("EMA enabled (decay={}, {} shadow params)", cfg.ema_decay, len(self.ema.shadow))
+
         # ---- torch.compile ----
         if cfg.torch_compile:
             self._compile_modules(cfg)
@@ -71,19 +84,6 @@ class I2VTrainer:
         self.params, self.optimizers, self.optimizer_te, self.optimizer_1, self.optimizer_2 = (
             self._build_optimizers(cfg)
         )
-
-        # ---- EMA ----
-        self.ema = None
-        if cfg.ema_decay > 0:
-            ema_models: dict[str, torch.nn.Module] = {}
-            if cfg.train_text_encoder:
-                ema_models["text_encoder"] = self.model.text_encoder
-            if self.model.transformer is not None:
-                ema_models["transformer"] = self.model.transformer
-            if self.model.transformer_2 is not None:
-                ema_models["transformer_2"] = self.model.transformer_2
-            self.ema = EMA(ema_models, decay=cfg.ema_decay)
-            logger.info("EMA enabled (decay={}, {} shadow params)", cfg.ema_decay, len(self.ema.shadow))
 
         self.total_steps = cfg.num_epochs * len(self.dataloader) // cfg.gradient_accumulation_steps
         logger.info(

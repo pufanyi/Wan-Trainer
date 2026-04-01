@@ -14,7 +14,7 @@ learning_rate: 1.0e-5
 weight_decay: 0.01
 max_grad_norm: 1.0
 warmup_steps: 20
-save_steps: 200
+save_steps: 500
 log_steps: 1
 seed: 42
 
