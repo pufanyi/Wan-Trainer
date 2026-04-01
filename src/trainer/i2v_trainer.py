@@ -460,7 +460,10 @@ class I2VTrainer:
         if self.ema is not None:
             ema_dir = path / "ema"
             ema_dir.mkdir(exist_ok=True)
-            torch.save(self.ema.state_dict(), ema_dir / f"rank{self.rank}.pt")
+            ema_file = ema_dir / f"rank{self.rank}.pt"
+            ema_tmp = ema_file.with_suffix(".pt.tmp")
+            torch.save(self.ema.state_dict(), ema_tmp)
+            ema_tmp.rename(ema_file)
         if self.rank == 0 and self.model.lora_config is not None:
             self.model.save_lora(str(path / "lora"))
         if self.rank == 0:
@@ -474,8 +477,11 @@ class I2VTrainer:
         if self.ema is not None:
             ema_file = Path(path) / "ema" / f"rank{self.rank}.pt"
             if ema_file.exists():
-                self.ema.load_state_dict(torch.load(ema_file, map_location=self.device, weights_only=True))
-                logger.info("Loaded EMA state from {}", ema_file)
+                try:
+                    self.ema.load_state_dict(torch.load(ema_file, map_location=self.device, weights_only=True))
+                    logger.info("Loaded EMA state from {}", ema_file)
+                except RuntimeError as e:
+                    logger.warning("Failed to load EMA state from {} ({}), skipping EMA restore", ema_file, e)
         logger.info(
             "Resumed at step={} epoch={} batch_idx={}",
             self.train_state.step,
