@@ -190,16 +190,10 @@ class I2VDataset(Dataset):
     def _load_video(video_path: str, height: int, width: int, cfg: _ItemConfig) -> torch.Tensor:
         """Load video frames as uint8. Returns (C, T, H, W)."""
         vr = decord.VideoReader(video_path, width=width, height=height)
-        video_fps = vr.get_avg_fps()
         total_frames = len(vr)
 
-        # Sample frames at target fps
-        stride = max(1, round(video_fps / cfg.fps))
-        indices = list(range(0, total_frames, stride))[: cfg.num_frames]
-
-        # Pad if not enough frames by repeating last
-        while len(indices) < cfg.num_frames:
-            indices.append(indices[-1])
+        # Uniformly sample num_frames across the entire video (stretch or compress)
+        indices = np.linspace(0, total_frames - 1, cfg.num_frames).round().astype(int).tolist()
 
         frames = vr.get_batch(indices)  # (T, H, W, C) uint8 torch tensor
         return frames.permute(3, 0, 1, 2).contiguous()

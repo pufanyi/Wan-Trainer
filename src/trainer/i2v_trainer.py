@@ -22,6 +22,28 @@ from src.trainer.flops import MFUMonitor, compute_wan_seq_len, estimate_wan_forw
 from src.trainer.utils import collate, cosine_lr, setup_loguru, shard_transformer, to_model_pixels
 
 
+def _apply_liger_rms_norm(model: torch.nn.Module) -> int:
+    """Replace all torch.nn.RMSNorm modules with LigerRMSNorm (fused Triton kernel)."""
+    from liger_kernel.transformers import LigerRMSNorm
+
+    count = 0
+    for parent_name, parent in list(model.named_modules()):
+        for name, module in list(parent.named_children()):
+            if not isinstance(module, torch.nn.RMSNorm):
+                continue
+            (hidden_size,) = module.normalized_shape
+            replacement = LigerRMSNorm(
+                hidden_size,
+                eps=module.eps,
+                elementwise_affine=module.elementwise_affine,
+            )
+            if module.weight is not None:
+                replacement.weight = module.weight
+            setattr(parent, name, replacement)
+            count += 1
+    return count
+
+
 def _format_eta(seconds: float) -> str:
     """Format seconds into a human-readable ETA string."""
     s = int(seconds)
@@ -119,11 +141,13 @@ class I2VTrainer:
             )
 
         # ---- Resume ----
-        resume_path = cfg.resume_from or (self._find_latest_checkpoint() if cfg.auto_resume else None)
+        # Priority: auto-resume from output_dir > explicit resume_from
+        auto_resume_path = self._find_latest_checkpoint() if cfg.auto_resume else None
+        resume_path = auto_resume_path or cfg.resume_from
         if resume_path:
-            # Auto-detect reset: explicit resume_from → reset; auto-resume from output_dir → keep
+            is_auto_resume = auto_resume_path is not None
             if cfg.reset_dataloader is None:
-                self._reset_on_load = cfg.resume_from is not None
+                self._reset_on_load = not is_auto_resume
             else:
                 self._reset_on_load = cfg.reset_dataloader
             self._load_checkpoint(resume_path)
@@ -151,6 +175,12 @@ class I2VTrainer:
             train_text_encoder=cfg.train_text_encoder,
             gradient_checkpointing=cfg.gradient_checkpointing,
         )
+        if cfg.use_liger_kernel:
+            count = 0
+            for m in [model.transformer, model.transformer_2]:
+                if m is not None:
+                    count += _apply_liger_rms_norm(m)
+            logger.info("Liger Kernel: replaced {} RMSNorm modules", count)
         model.text_encoder.to(self.device)
         model.vae.to(self.device)
         return model

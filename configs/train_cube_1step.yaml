@@ -21,3 +21,5 @@ ema_decay: 0.99
 resume_from: storage/checkpoints/cube_test/checkpoint-9000
 
 wandb_project: wan-i2v
+
+use_liger_kernel: true

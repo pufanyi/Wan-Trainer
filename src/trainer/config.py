@@ -43,6 +43,9 @@ class TrainConfig(BaseModel):
     param_dtype: Literal["bfloat16", "float32"] = "bfloat16"
     reduce_dtype: Literal["float32", "bfloat16"] = "float32"
 
+    # Liger Kernel (fused Triton kernels)
+    use_liger_kernel: bool = False
+
     # torch.compile
     torch_compile: bool = False
     torch_compile_backend: str = "inductor"
