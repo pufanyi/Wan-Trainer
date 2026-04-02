@@ -64,3 +64,16 @@ class TrainConfig(BaseModel):
     # Logging
     wandb_project: str | None = None
     wandb_run_name: str | None = None
+
+    # GRPO (set grpo_group_size > 0 to enable Flow-GRPO training)
+    grpo_group_size: int | None = None  # G: number of samples per prompt. None = SFT mode
+    grpo_sample_batch_size: int = 1  # how many G samples to batch together (tune for GPU memory)
+    grpo_num_sampling_steps: int = 10  # T: denoising steps during SDE sampling
+    grpo_clip_range: float = 1e-3  # PPO clipping epsilon
+    grpo_kl_coeff: float = 0.004  # beta: KL penalty coefficient against reference policy
+    grpo_sde_noise_scale: float = 0.7  # a in sigma_t = a * sqrt(t / (1-t))
+    grpo_sde_sigma_min: float = 0.0  # noise floor for SDE std
+    grpo_sde_sigma_max: float = 1.0  # noise ceiling for SDE std
+    grpo_adv_clip_max: float = 5.0  # clamp advantages to [-max, max]
+    grpo_reward_fn: str = "neg_loss"  # reward function name
+    grpo_cfg_scale: float = 1.0  # classifier-free guidance scale during sampling

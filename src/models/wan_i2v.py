@@ -6,6 +6,7 @@ components from the WanImageToVideoPipeline.
 
 import html
 import json
+import math
 from pathlib import Path
 
 import ftfy
@@ -387,3 +388,301 @@ class WanI2VForTraining:
             total_weight = total_weight + selected_weights.sum()
 
         return loss / total_weight if total_weight > 0 else loss
+
+    # ------------------------------------------------------------------
+    # Flow-GRPO: SDE sampling & log-probability computation
+    # ------------------------------------------------------------------
+
+    def _get_expert_for_timestep(self, timestep: float) -> "WanTransformer3DModel":
+        """Route a single scalar timestep to the correct MoE expert."""
+        if self.transformer is not None and self.transformer_2 is not None:
+            return self.transformer if timestep >= self.boundary_timestep else self.transformer_2
+        return self.transformer if self.transformer is not None else self.transformer_2
+
+    def _sde_step(
+        self,
+        sample: torch.Tensor,
+        model_output: torch.Tensor,
+        sigma: float,
+        sigma_prev: float,
+        sde_noise_scale: float = 0.7,
+        sigma_min: float = 0.0,
+        sigma_max: float = 1.0,
+        noise: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Single SDE denoising step with log-probability computation.
+
+        Converts the deterministic ODE step into a stochastic SDE step following
+        Flow-GRPO (arXiv:2505.05470). The transition becomes Gaussian, enabling
+        tractable log-probability and importance ratio computation.
+
+        Args:
+            sample: Current noisy latent x_t. Shape (B, C, T, H, W).
+            model_output: Velocity prediction v_θ(x_t, t). Same shape.
+            sigma: Current noise level (going from 1→0 during denoising).
+            sigma_prev: Next noise level (closer to 0).
+            sde_noise_scale: Controls exploration. 'a' in σ_sde = a*√(t/(1-t)).
+            sigma_min: Floor for SDE noise std.
+            sigma_max: Ceiling for SDE noise std.
+            noise: Pre-sampled noise (for reproducibility). If None, sampled here.
+
+        Returns:
+            (prev_sample, prev_sample_mean, log_prob):
+            - prev_sample: x_{t-1} after stochastic step
+            - prev_sample_mean: deterministic mean (for KL computation)
+            - log_prob: per-sample log probability, shape (B,)
+        """
+        dt = sigma_prev - sigma  # negative (denoising direction)
+
+        # SDE noise std: interpolate between sigma_min and sigma_max based on sigma
+        std_dev_t = sigma_min + (sigma_max - sigma_min) * sigma
+
+        # Transition mean (SDE drift = ODE drift + score correction)
+        # prev_mean = x + [v + std²/(2σ) * (x + (1-σ)*v)] * dt
+        if sigma > 1e-8:
+            score_coeff = std_dev_t**2 / (2.0 * sigma)
+            prev_sample_mean = (
+                sample * (1.0 + score_coeff * dt)
+                + model_output * (1.0 + std_dev_t**2 * (1.0 - sigma) / (2.0 * sigma)) * dt
+            )
+        else:
+            # At sigma ≈ 0, skip score correction to avoid division by zero
+            prev_sample_mean = sample + model_output * dt
+
+        # Stochastic noise injection
+        noise_scale = std_dev_t * math.sqrt(max(-dt, 0.0))
+        if noise is None:
+            noise = torch.randn_like(sample)
+        prev_sample = prev_sample_mean + noise_scale * noise
+
+        # Log probability under the Gaussian transition
+        if noise_scale > 1e-8:
+            log_prob = (
+                -((prev_sample - prev_sample_mean) ** 2) / (2.0 * noise_scale**2)
+                - math.log(noise_scale)
+                - 0.5 * math.log(2.0 * math.pi)
+            )
+            # Mean across all dims except batch → per-sample scalar
+            log_prob = log_prob.mean(dim=list(range(1, log_prob.ndim)))
+        else:
+            log_prob = torch.zeros(sample.shape[0], device=sample.device)
+
+        return prev_sample, prev_sample_mean, log_prob
+
+    @torch.no_grad()
+    def sde_generate(
+        self,
+        condition: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        num_sampling_steps: int = 10,
+        sde_noise_scale: float = 0.7,
+        sigma_min: float = 0.0,
+        sigma_max: float = 1.0,
+        cfg_scale: float = 1.0,
+        generator: torch.Generator | None = None,
+    ) -> dict:
+        """Generate video latents via SDE sampling, storing per-step data for GRPO.
+
+        Runs the full denoising loop using the SDE formulation, collecting
+        intermediate latents and log-probabilities needed for policy gradient.
+
+        Args:
+            condition: (B, 4+z_dim, T', H', W') from prepare_condition.
+            prompt_embeds: (B, 512, text_dim) text embeddings.
+            num_sampling_steps: Number of denoising steps T.
+            sde_noise_scale: 'a' parameter for SDE noise.
+            sigma_min: Noise floor.
+            sigma_max: Noise ceiling.
+            cfg_scale: Classifier-free guidance scale (1.0 = no guidance).
+            generator: Optional RNG for reproducibility.
+
+        Returns:
+            dict with keys:
+                - latents: list of T+1 latents [x_T, x_{T-1}, ..., x_0]
+                - log_probs: list of T per-step log probabilities
+                - timesteps: list of T timestep values
+                - sigmas: list of T+1 sigma values
+                - noises: list of T noise vectors (for recomputation)
+        """
+        B = condition.shape[0]
+        device = condition.device
+        latent_shape = (B, condition.shape[1] - 4, *condition.shape[2:])  # (B, z_dim, T', H', W')
+
+        # Build sigma schedule for sampling: T+1 values from 1→0
+        # Use linspace in [0, 1] then apply the shifted schedule
+        t_values = torch.linspace(1.0, 0.0, num_sampling_steps + 1, device=device)
+        shift = 5.0
+        sigmas = shift * t_values / (1.0 + (shift - 1.0) * t_values)
+
+        # Start from pure noise
+        latent = torch.randn(latent_shape, device=device, dtype=torch.bfloat16, generator=generator)
+
+        all_latents = [latent]
+        all_log_probs = []
+        all_timesteps = []
+        all_noises = []
+
+        for i in range(num_sampling_steps):
+            sigma = sigmas[i].item()
+            sigma_prev = sigmas[i + 1].item()
+            timestep_val = sigma * self.num_train_timesteps
+
+            # Select expert based on timestep
+            transformer = self._get_expert_for_timestep(timestep_val)
+
+            # Build model input: [noisy_latents, condition]
+            model_input = torch.cat([latent, condition], dim=1)
+
+            # Forward pass through transformer
+            timestep_tensor = torch.tensor([timestep_val], device=device, dtype=torch.bfloat16).expand(B)
+            model_output = transformer(
+                hidden_states=model_input,
+                timestep=timestep_tensor,
+                encoder_hidden_states=prompt_embeds,
+                return_dict=False,
+            )[0]
+
+            # CFG (if scale > 1)
+            if cfg_scale > 1.0 and self.transformer is not None:
+                # Unconditional forward with zero prompt
+                uncond_embeds = torch.zeros_like(prompt_embeds)
+                uncond_output = transformer(
+                    hidden_states=model_input,
+                    timestep=timestep_tensor,
+                    encoder_hidden_states=uncond_embeds,
+                    return_dict=False,
+                )[0]
+                model_output = uncond_output + cfg_scale * (model_output - uncond_output)
+
+            # SDE step
+            noise = torch.randn_like(latent, generator=generator)
+            latent, prev_mean, log_prob = self._sde_step(
+                sample=latent,
+                model_output=model_output,
+                sigma=sigma,
+                sigma_prev=sigma_prev,
+                sde_noise_scale=sde_noise_scale,
+                sigma_min=sigma_min,
+                sigma_max=sigma_max,
+                noise=noise,
+            )
+
+            all_latents.append(latent)
+            all_log_probs.append(log_prob)
+            all_timesteps.append(timestep_val)
+            all_noises.append(noise)
+
+        return {
+            "latents": all_latents,
+            "log_probs": all_log_probs,
+            "timesteps": all_timesteps,
+            "sigmas": sigmas,
+            "noises": all_noises,
+        }
+
+    def compute_log_prob_and_kl(
+        self,
+        latent: torch.Tensor,
+        next_latent: torch.Tensor,
+        noise: torch.Tensor,
+        condition: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        sigma: float,
+        sigma_prev: float,
+        sde_noise_scale: float = 0.7,
+        sigma_min: float = 0.0,
+        sigma_max: float = 1.0,
+        use_ref: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Recompute log-probability and KL for a stored (x_t, x_{t-1}) pair.
+
+        Used in the GRPO training phase to compute importance ratios and KL
+        divergence against the reference policy.
+
+        Args:
+            latent: x_t, the noisy latent at step t. Shape (B, C, T, H, W).
+            next_latent: x_{t-1}, the denoised latent at step t-1.
+            noise: The noise vector used in the original SDE step.
+            condition: (B, 4+z_dim, T', H', W').
+            prompt_embeds: (B, 512, text_dim).
+            sigma: Noise level at step t.
+            sigma_prev: Noise level at step t-1.
+            sde_noise_scale: SDE noise parameter.
+            sigma_min: Noise floor.
+            sigma_max: Noise ceiling.
+            use_ref: If True, disable LoRA adapters to use reference policy.
+
+        Returns:
+            (log_prob, kl_div, prev_sample_mean):
+            - log_prob: Per-sample log probability under current/ref policy, shape (B,).
+            - kl_div: Per-sample KL divergence between current and ref means, shape (B,).
+            - prev_sample_mean: The predicted mean (for KL computation).
+        """
+        timestep_val = sigma * self.num_train_timesteps
+        B = latent.shape[0]
+        device = latent.device
+
+        # Select expert
+        transformer = self._get_expert_for_timestep(timestep_val)
+
+        # Optionally switch to reference policy
+        if use_ref:
+            transformer.disable_adapters()
+
+        # Forward pass
+        model_input = torch.cat([latent, condition], dim=1)
+        timestep_tensor = torch.tensor([timestep_val], device=device, dtype=torch.bfloat16).expand(B)
+        model_output = transformer(
+            hidden_states=model_input,
+            timestep=timestep_tensor,
+            encoder_hidden_states=prompt_embeds,
+            return_dict=False,
+        )[0]
+
+        # Re-enable adapters
+        if use_ref:
+            transformer.enable_adapters()
+
+        # Compute mean from the SDE step formula
+        dt = sigma_prev - sigma
+        std_dev_t = sigma_min + (sigma_max - sigma_min) * sigma
+
+        if sigma > 1e-8:
+            prev_sample_mean = (
+                latent * (1.0 + std_dev_t**2 / (2.0 * sigma) * dt)
+                + model_output * (1.0 + std_dev_t**2 * (1.0 - sigma) / (2.0 * sigma)) * dt
+            )
+        else:
+            prev_sample_mean = latent + model_output * dt
+
+        # Log probability
+        noise_scale = std_dev_t * math.sqrt(max(-dt, 0.0))
+        if noise_scale > 1e-8:
+            log_prob = (
+                -((next_latent - prev_sample_mean) ** 2) / (2.0 * noise_scale**2)
+                - math.log(noise_scale)
+                - 0.5 * math.log(2.0 * math.pi)
+            )
+            log_prob = log_prob.mean(dim=list(range(1, log_prob.ndim)))
+        else:
+            log_prob = torch.zeros(B, device=device)
+
+        # KL divergence placeholder (computed externally between current and ref means)
+        kl_div = torch.zeros(B, device=device)
+
+        return log_prob, kl_div, prev_sample_mean
+
+    @torch.no_grad()
+    def decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        """Decode normalized latents back to pixel space via VAE.
+
+        Args:
+            latents: (B, z_dim, T', H', W') normalized latents.
+
+        Returns:
+            (B, C, T, H, W) pixel-space video in [-1, 1].
+        """
+        mean, std_inv = self._get_latent_stats(latents.device, latents.dtype)
+        # Undo normalization: latents = (raw - mean) * std_inv → raw = latents / std_inv + mean
+        raw_latents = latents / std_inv + mean
+        return self.vae.decode(raw_latents.to(self.vae.dtype)).sample

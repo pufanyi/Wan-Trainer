@@ -7,6 +7,39 @@ from loguru import logger
 from torch.distributed._composable.fsdp import fully_shard
 
 
+def apply_liger_rms_norm(model: torch.nn.Module) -> int:
+    """Replace all torch.nn.RMSNorm modules with LigerRMSNorm (fused Triton kernel)."""
+    from liger_kernel.transformers import LigerRMSNorm
+
+    count = 0
+    for parent_name, parent in list(model.named_modules()):
+        for name, module in list(parent.named_children()):
+            if not isinstance(module, torch.nn.RMSNorm):
+                continue
+            (hidden_size,) = module.normalized_shape
+            replacement = LigerRMSNorm(hidden_size, eps=module.eps, elementwise_affine=module.elementwise_affine)
+            if module.weight is not None:
+                replacement.weight = module.weight
+            setattr(parent, name, replacement)
+            count += 1
+    return count
+
+
+def format_eta(seconds: float) -> str:
+    """Format seconds into a human-readable ETA string."""
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    if h < 24:
+        return f"{h}h{m:02d}m"
+    d, h = divmod(h, 24)
+    return f"{d}d{h:02d}h"
+
+
 def cosine_lr(step: int, warmup: int, total: int, base_lr: float) -> float:
     """Linear warmup + cosine decay."""
     if step < warmup:

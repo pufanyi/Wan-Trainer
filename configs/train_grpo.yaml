@@ -1,0 +1,33 @@
+model_path: storage/models/Wan2.2-I2V-A14B-Diffusers
+dataset_json: data/cube_1step.json
+output_dir: storage/checkpoints/grpo
+
+num_workers: 16
+
+batch_size: 1
+num_epochs: 2
+learning_rate: 1.0e-4
+weight_decay: 0.01
+max_grad_norm: 1.0
+warmup_steps: 50
+save_steps: 50
+log_steps: 1
+seed: 42
+
+# LoRA (recommended for GRPO — reference policy = base model via disable_adapter)
+lora_rank: 32
+lora_alpha: 64
+
+gradient_checkpointing: true
+use_liger_kernel: true
+
+# Flow-GRPO
+grpo_group_size: 16         # G: samples per prompt
+grpo_sample_batch_size: 4   # S: how many G samples per forward pass (tune for GPU memory)
+grpo_num_sampling_steps: 10 # T: SDE denoising steps
+grpo_clip_range: 1.0e-3     # PPO clipping epsilon
+grpo_kl_coeff: 0.004        # KL penalty coefficient
+grpo_sde_noise_scale: 0.7   # SDE noise scale 'a'
+grpo_reward_fn: neg_loss    # reward = -flow_matching_loss
+
+wandb_project: wan-grpo
