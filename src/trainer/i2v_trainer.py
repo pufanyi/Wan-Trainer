@@ -121,6 +121,11 @@ class I2VTrainer:
         # ---- Resume ----
         resume_path = cfg.resume_from or (self._find_latest_checkpoint() if cfg.auto_resume else None)
         if resume_path:
+            # Auto-detect reset: explicit resume_from → reset; auto-resume from output_dir → keep
+            if cfg.reset_dataloader is None:
+                self._reset_on_load = cfg.resume_from is not None
+            else:
+                self._reset_on_load = cfg.reset_dataloader
             self._load_checkpoint(resume_path)
 
     # ------------------------------------------------------------------
@@ -491,11 +496,27 @@ class I2VTrainer:
         if self.ema is not None and "ema" not in state:
             self.ema.reinitialize()
             logger.warning("EMA not in DCP checkpoint, reinitialized from loaded model weights")
-        # Restore dataloader state for efficient resume (skip without re-iterating)
-        dl_state_path = Path(path) / f"dataloader_rank{self.rank}.pt"
-        if dl_state_path.exists():
-            self.dataloader.load_state_dict(torch.load(dl_state_path, weights_only=False))
-            logger.info("Restored dataloader state from {}", dl_state_path)
+        if self._reset_on_load:
+            # Reset training progress (keep model weights, discard iteration state)
+            self.train_state.step = 0
+            self.train_state.epoch = 0
+            self.train_state.batch_idx = 0
+            # Re-create optimizers so LR warmup and momentum start fresh
+            self.params, self.optimizers, self.optimizer_te, self.optimizer_1, self.optimizer_2 = (
+                self._build_optimizers(self.cfg)
+            )
+            self.train_state.optimizer_te = self.optimizer_te
+            self.train_state.optimizer_1 = self.optimizer_1
+            self.train_state.optimizer_2 = self.optimizer_2
+            # Recompute total_steps with new dataset size
+            self.total_steps = self.cfg.num_epochs * len(self.dataloader) // self.cfg.gradient_accumulation_steps
+            logger.info("reset_dataloader=True: reset step/epoch/optimizer, total_steps={}", self.total_steps)
+        else:
+            # Restore dataloader state for efficient resume (skip without re-iterating)
+            dl_state_path = Path(path) / f"dataloader_rank{self.rank}.pt"
+            if dl_state_path.exists():
+                self.dataloader.load_state_dict(torch.load(dl_state_path, weights_only=False))
+                logger.info("Restored dataloader state from {}", dl_state_path)
         logger.info(
             "Resumed at step={} epoch={} batch_idx={}",
             self.train_state.step,

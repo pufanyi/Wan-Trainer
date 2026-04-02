@@ -56,6 +56,7 @@ class TrainConfig(BaseModel):
     # Checkpoint
     resume_from: str | None = None
     auto_resume: bool = True  # auto-detect latest checkpoint in output_dir
+    reset_dataloader: bool | None = None  # None = auto (reset when resume_from is set, keep when auto-resuming from output_dir)
 
     # Logging
     wandb_project: str | None = None

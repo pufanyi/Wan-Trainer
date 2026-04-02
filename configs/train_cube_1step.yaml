@@ -1,0 +1,23 @@
+model_path: storage/models/Wan2.2-I2V-A14B-Diffusers
+dataset_json: data/cube_1step_more_data.json
+output_dir: storage/checkpoints/cube_more_1step
+
+num_workers: 16
+
+batch_size: 1
+gradient_accumulation_steps: 1
+num_epochs: 2
+learning_rate: 5.0e-5
+weight_decay: 0.01
+max_grad_norm: 1.0
+warmup_steps: 100
+save_steps: 1000
+log_steps: 1
+seed: 42
+
+torch_compile: true
+ema_decay: 0.99
+
+resume_from: storage/checkpoints/cube_test/checkpoint-9000
+
+wandb_project: wan-i2v
