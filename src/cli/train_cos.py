@@ -1,4 +1,4 @@
-"""Wan2.2 I2V COS (Chain-of-Search) training entry point.
+"""Wan2.2 I2V COS (Chain-of-Step) training entry point.
 
 Usage:
     torchrun --nproc_per_node=8 -m src.cli.train_cos --config configs/train_cos.yaml

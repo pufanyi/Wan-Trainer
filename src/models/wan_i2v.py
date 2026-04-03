@@ -390,7 +390,7 @@ class WanI2VForTraining:
         return loss / total_weight if total_weight > 0 else loss
 
     # ------------------------------------------------------------------
-    # COS (Chain-of-Search) piecewise flow matching
+    # COS (Chain-of-Step) piecewise flow matching
     # ------------------------------------------------------------------
 
     def compute_cos_loss(

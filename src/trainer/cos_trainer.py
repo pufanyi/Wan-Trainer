@@ -1,4 +1,4 @@
-"""Wan2.2 I2V COS (Chain-of-Search) Trainer with FSDP2 + DCP.
+"""Wan2.2 I2V COS (Chain-of-Step) Trainer with FSDP2 + DCP.
 
 Piecewise flow matching: noise -> search_state -> final_state.
 Extends the standard I2V SFT trainer with a two-stage training path
