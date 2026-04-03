@@ -5,7 +5,8 @@ JSON format (list of items — legacy):
     {
         "video": "path/to/video.mp4",             // absolute or relative to JSON dir
         "image": "ref.jpg" | ["ref.jpg"],          // optional, uses first video frame if absent
-        "prompt": "description of the video"
+        "prompt": "description of the video",
+        "search_video": "path/to/search.mp4"      // optional, for COS training
     }
 ]
 
@@ -36,6 +37,8 @@ JSON format (list of dataset configs — multi-dataset):
 """
 
 import json
+import logging
+import random
 from pathlib import Path
 
 import decord
@@ -44,6 +47,8 @@ import torch
 from PIL import Image
 from pydantic import BaseModel
 from torch.utils.data import Dataset
+
+logger = logging.getLogger(__name__)
 
 decord.bridge.set_bridge("torch")
 
@@ -206,7 +211,25 @@ class I2VDataset(Dataset):
             array = np.array(img, dtype=np.uint8)
         return torch.from_numpy(array).permute(2, 0, 1).contiguous()
 
+    _MAX_RETRIES = 10
+
     def __getitem__(self, idx):
+        for attempt in range(self._MAX_RETRIES):
+            try:
+                return self._load_item(idx)
+            except Exception:
+                logger.warning(
+                    "Failed to load item %d (attempt %d/%d), trying another sample.",
+                    idx,
+                    attempt + 1,
+                    self._MAX_RETRIES,
+                    exc_info=True,
+                )
+                idx = random.randint(0, len(self.data) - 1)
+        # Final attempt — let it raise if it still fails.
+        return self._load_item(idx)
+
+    def _load_item(self, idx):
         item = self.data[idx]
         cfg = self._item_configs[idx]
         base_dir = self._base_dirs[idx]
@@ -221,9 +244,16 @@ class I2VDataset(Dataset):
             raw_image = raw_image[0] if raw_image else None
         image = self._load_image(self._resolve(raw_image, base_dir), height, width) if raw_image else video[:, 0].clone()
 
-        return {
+        result = {
             "index": idx,
             "video": video,
             "image": image,
             "prompt": item["prompt"],
         }
+
+        # Optional search_video for COS training
+        if "search_video" in item:
+            search_path = self._resolve(item["search_video"], base_dir)
+            result["search_video"] = self._load_video(search_path, height, width, cfg)
+
+        return result

@@ -77,3 +77,8 @@ class TrainConfig(BaseModel):
     grpo_adv_clip_max: float = 5.0  # clamp advantages to [-max, max]
     grpo_reward_fn: str = "neg_loss"  # reward function name
     grpo_cfg_scale: float = 1.0  # classifier-free guidance scale during sampling
+
+    # COS (Chain-of-Search) piecewise flow matching
+    cos_tau_sigma: float = 0.5  # piecewise boundary in sigma space (independent of MoE boundary)
+    cos_boundary_noise_std: float = 0.02  # Gaussian perturbation std for x_tau in low stage
+    cos_use_standard_formula: bool = False  # ablation: use standard sigma formula per segment (discontinuous)

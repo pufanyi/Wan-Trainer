@@ -390,6 +390,163 @@ class WanI2VForTraining:
         return loss / total_weight if total_weight > 0 else loss
 
     # ------------------------------------------------------------------
+    # COS (Chain-of-Search) piecewise flow matching
+    # ------------------------------------------------------------------
+
+    def compute_cos_loss(
+        self,
+        x_final: torch.Tensor,
+        x_tau: torch.Tensor,
+        condition: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        tau_sigma: float = 0.5,
+        boundary_noise_std: float = 0.02,
+        use_standard_formula: bool = False,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Compute piecewise flow-matching loss for COS training.
+
+        Solution A (default): rescaled parameterization ensuring path continuity.
+            High stage (sigma >= tau): s_h = (sigma - tau)/(1 - tau)
+                x_t = s_h * z + (1 - s_h) * x_tau
+                v_target = (z - x_tau) / (1 - tau)
+            Low stage (sigma < tau): s_l = sigma / tau
+                x_t = s_l * x_tau_tilde + (1 - s_l) * x_final
+                v_target = (x_tau_tilde - x_final) / tau
+
+        Solution B (ablation, use_standard_formula=True): standard sigma formula
+            per segment (discontinuous at boundary but balanced magnitudes).
+            High stage: x_t = sigma * z + (1-sigma) * x_tau, target = z - x_tau
+            Low stage:  x_t = sigma * x_tau_tilde + (1-sigma) * x_final,
+                        target = x_tau_tilde - x_final
+
+        Args:
+            x_final: (B, z_dim, T', H', W') latents of the final execution video.
+            x_tau: (B, z_dim, T', H', W') latents of the search video.
+            condition: (B, 4 + z_dim, T', H', W') from prepare_condition.
+            prompt_embeds: (B, 512, text_dim).
+            tau_sigma: Piecewise boundary in sigma space.
+            boundary_noise_std: Gaussian perturbation std for x_tau in low stage.
+            use_standard_formula: If True, use Solution B (ablation).
+
+        Returns:
+            (loss, debug_dict) where debug_dict has per-stage stats.
+        """
+        B = x_final.shape[0]
+        device = x_final.device
+        shifted_sigmas, shifted_timesteps, bsmntw = self._get_training_buffers(device)
+
+        # Sample random timestep indices
+        if self.train_experts == "high":
+            indices = torch.randint(0, self.boundary_idx, (B,), device=device)
+        elif self.train_experts == "low":
+            indices = torch.randint(self.boundary_idx, self.num_train_timesteps, (B,), device=device)
+        else:
+            indices = torch.randint(0, self.num_train_timesteps, (B,), device=device)
+
+        sigmas = shifted_sigmas.index_select(0, indices)  # (B,)
+        timesteps = shifted_timesteps.index_select(0, indices)
+        weights = bsmntw.index_select(0, indices)
+
+        sigmas_5d = sigmas.view(B, 1, 1, 1, 1)
+        noise = torch.randn_like(x_final)
+
+        # Determine which samples fall in high vs low stage
+        high_mask = sigmas >= tau_sigma  # (B,)
+        low_mask = ~high_mask
+
+        # Build x_t and v_target per sample
+        x_t = torch.zeros_like(x_final)
+        target = torch.zeros_like(x_final)
+
+        # ---- High stage: noise -> x_tau ----
+        if high_mask.any():
+            s_high = sigmas_5d  # will be indexed below
+            z_h = noise[high_mask]
+            x_tau_h = x_tau[high_mask]
+            sigma_h = sigmas_5d[high_mask]
+
+            if use_standard_formula:
+                # Solution B: x_t = sigma * z + (1-sigma) * x_tau
+                x_t[high_mask] = sigma_h * z_h + (1.0 - sigma_h) * x_tau_h
+                target[high_mask] = z_h - x_tau_h
+            else:
+                # Solution A: rescaled for continuity
+                s_h = (sigma_h - tau_sigma) / (1.0 - tau_sigma)
+                x_t[high_mask] = s_h * z_h + (1.0 - s_h) * x_tau_h
+                target[high_mask] = (z_h - x_tau_h) / (1.0 - tau_sigma)
+
+        # ---- Low stage: x_tau -> x_final ----
+        if low_mask.any():
+            x_tau_l = x_tau[low_mask]
+            x_final_l = x_final[low_mask]
+            sigma_l = sigmas_5d[low_mask]
+
+            # Boundary perturbation
+            if boundary_noise_std > 0:
+                eps = torch.randn_like(x_tau_l) * boundary_noise_std
+                x_tau_l = x_tau_l + eps
+
+            if use_standard_formula:
+                # Solution B: x_t = sigma * x_tau_tilde + (1-sigma) * x_final
+                x_t[low_mask] = sigma_l * x_tau_l + (1.0 - sigma_l) * x_final_l
+                target[low_mask] = x_tau_l - x_final_l
+            else:
+                # Solution A: rescaled for continuity
+                s_l = sigma_l / tau_sigma
+                x_t[low_mask] = s_l * x_tau_l + (1.0 - s_l) * x_final_l
+                target[low_mask] = (x_tau_l - x_final_l) / tau_sigma
+
+        # ---- Model forward with MoE routing (unchanged) ----
+        model_input = torch.cat([x_t, condition], dim=1)
+
+        experts = []
+        if self.transformer is not None:
+            experts.append(((timesteps >= self.boundary_timestep).nonzero(as_tuple=False).flatten(), self.transformer))
+        if self.transformer_2 is not None:
+            experts.append(((timesteps < self.boundary_timestep).nonzero(as_tuple=False).flatten(), self.transformer_2))
+
+        loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+        total_weight = torch.tensor(0.0, device=device, dtype=torch.float32)
+
+        for selected, transformer in experts:
+            if selected.numel() == 0:
+                continue
+            pred = transformer(
+                hidden_states=model_input.index_select(0, selected),
+                timestep=timesteps.index_select(0, selected),
+                encoder_hidden_states=prompt_embeds.index_select(0, selected),
+                return_dict=False,
+            )[0]
+            per_sample_loss = F.mse_loss(pred.float(), target.index_select(0, selected).float(), reduction="none")
+            per_sample_loss = per_sample_loss.mean(dim=list(range(1, per_sample_loss.ndim)))
+            selected_weights = weights.index_select(0, selected)
+            loss = loss + (per_sample_loss * selected_weights).sum()
+            total_weight = total_weight + selected_weights.sum()
+
+        final_loss = loss / total_weight if total_weight > 0 else loss
+
+        # ---- Debug stats ----
+        with torch.no_grad():
+            n_high = high_mask.sum().item()
+            n_low = low_mask.sum().item()
+
+            def _per_sample_norm(t: torch.Tensor) -> float:
+                # (N, ...) -> mean of per-sample L2 norms
+                return t.float().reshape(t.shape[0], -1).norm(dim=1).mean().item()
+
+            debug = {
+                "n_high": n_high,
+                "n_low": n_low,
+                "target_norm_high": _per_sample_norm(target[high_mask]) if n_high > 0 else 0.0,
+                "target_norm_low": _per_sample_norm(target[low_mask]) if n_low > 0 else 0.0,
+                "sigma_mean": sigmas.mean().item(),
+                "sigma_min": sigmas.min().item(),
+                "sigma_max": sigmas.max().item(),
+            }
+
+        return final_loss, debug
+
+    # ------------------------------------------------------------------
     # Flow-GRPO: SDE sampling & log-probability computation
     # ------------------------------------------------------------------
 
