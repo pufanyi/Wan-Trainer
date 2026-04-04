@@ -136,6 +136,35 @@ class COSTrainer(BaseTrainer):
                     if self.mfu_monitor is not None:
                         self.mfu_monitor.step()
 
+                    # -- Expert-parallel metric exchange --
+                    # Both group leaders participate: low sends its stats to rank 0.
+                    if (
+                        self.expert_parallel
+                        and global_step % cfg.log_steps == 0
+                        and self.dp_rank == 0
+                    ):
+                        import torch.distributed as dist
+
+                        _ep_keys = ["loss", "target_norm", "sigma_mean", "n_cos_high", "n_cos_low"]
+                        half = self.world_size // 2
+                        if self.expert_group == 1:
+                            # Low group leader: send averaged metrics to rank 0
+                            cnt = max(self._cos_debug_count, 1)
+                            avg_local = {k: v / cnt for k, v in self._cos_debug_accum.items()}
+                            buf = torch.tensor(
+                                [avg_local.get(f"{k}_low", 0.0) for k in _ep_keys],
+                                device=self.device,
+                            )
+                            dist.send(buf, dst=0)
+                            self._cos_debug_accum.clear()
+                            self._cos_debug_count = 0
+                        elif self.expert_group == 0:
+                            buf = torch.zeros(len(_ep_keys), device=self.device)
+                            dist.recv(buf, src=half)
+                            self._remote_expert_avg = {
+                                f"{k}_low": v for k, v in zip(_ep_keys, buf.tolist())
+                            }
+
                     if self.rank == 0 and global_step % cfg.log_steps == 0:
                         mfu = self.mfu_monitor.flush() if self.mfu_monitor is not None else None
                         mfu_str = f"{mfu:.1%}" if mfu is not None else "-"
@@ -146,18 +175,23 @@ class COSTrainer(BaseTrainer):
                             secs_per_step = elapsed / steps_done
                             eta_secs = secs_per_step * (self.total_steps - global_step)
                             eta_str = format_eta(eta_secs)
-                            it_s_str = f"{1 / secs_per_step:.2f}"
+                            s_it_str = f"{secs_per_step:.1f}"
                         else:
                             eta_str = "?"
-                            it_s_str = "?"
+                            s_it_str = "?"
 
                         cnt = max(self._cos_debug_count, 1)
                         avg = {k: v / cnt for k, v in self._cos_debug_accum.items()}
 
+                        # Merge remote expert metrics if available
+                        if self.expert_parallel and hasattr(self, "_remote_expert_avg"):
+                            avg.update(self._remote_expert_avg)
+                            del self._remote_expert_avg
+
                         logger.info(
-                            "step={}/{} epoch={} loss={:.4f} lr={:.2e} grad_norm={:.4f} mfu={} eta={} ({} it/s)",
+                            "step={}/{} epoch={} loss={:.4f} lr={:.2e} grad_norm={:.4f} mfu={} eta={} ({} s/it)",
                             global_step, self.total_steps, epoch,
-                            loss.item(), lr, self._last_grad_norm, mfu_str, eta_str, it_s_str,
+                            loss.item(), lr, self._last_grad_norm, mfu_str, eta_str, s_it_str,
                         )
 
                         # Per-expert debug lines

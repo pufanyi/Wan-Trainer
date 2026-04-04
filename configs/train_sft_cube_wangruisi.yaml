@@ -1,0 +1,24 @@
+model_path: storage/models/Wan2.2-I2V-A14B-Diffusers
+dataset_json: /mnt/umm/users/pufanyi/workspace/cube/dataset_wangruisi/config.json
+output_dir: storage/checkpoints/sft_cube_wangruisi
+
+fps: 16
+
+batch_size: 8
+gradient_accumulation_steps: 1
+num_epochs: 1
+learning_rate: 5.0e-5
+weight_decay: 0.01
+max_grad_norm: 1.0
+warmup_steps: 100
+save_steps: 1000
+log_steps: 1
+seed: 42
+
+ema_decay: 0.99
+
+expert_parallel: true
+train_experts: both
+# train_text_encoder: true
+
+wandb_project: wan-i2v

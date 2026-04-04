@@ -440,7 +440,7 @@ class WanI2VForTraining:
             sigmas = shifted_sigmas.index_select(0, indices)
             timesteps = shifted_timesteps.index_select(0, indices)
             weights = bsmntw.index_select(0, indices)
-            sigmas_5d = sigmas.view(B, 1, 1, 1, 1)
+            sigmas_5d = sigmas.view(B, 1, 1, 1, 1).to(x_final.dtype)
 
             noise = torch.randn_like(x_final)
 

@@ -118,15 +118,15 @@ class I2VTrainer(BaseTrainer):
                             secs_per_step = elapsed / steps_done
                             eta_secs = secs_per_step * (self.total_steps - global_step)
                             eta_str = format_eta(eta_secs)
-                            it_s_str = f"{1 / secs_per_step:.2f}"
+                            s_it_str = f"{secs_per_step:.1f}"
                         else:
                             eta_str = "?"
-                            it_s_str = "?"
+                            s_it_str = "?"
 
                         logger.info(
-                            "step={}/{} epoch={} loss={:.4f} lr={:.2e} grad_norm={:.4f} mfu={} eta={} ({} it/s)",
+                            "step={}/{} epoch={} loss={:.4f} lr={:.2e} grad_norm={:.4f} mfu={} eta={} ({} s/it)",
                             global_step, self.total_steps, epoch,
-                            loss.item(), lr, self._last_grad_norm, mfu_str, eta_str, it_s_str,
+                            loss.item(), lr, self._last_grad_norm, mfu_str, eta_str, s_it_str,
                         )
 
                         if self.use_wandb:
