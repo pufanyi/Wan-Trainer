@@ -45,6 +45,9 @@ class BaseTrainer:
         torch.cuda.set_device(self.device)
         torch.manual_seed(cfg.seed + self.rank)
 
+        # ---- Expert parallel (must run before model build) ----
+        self._init_expert_parallel(cfg)
+
         setup_loguru(self.rank)
         logger.info("World size: {}", self.world_size)
 
@@ -118,6 +121,37 @@ class BaseTrainer:
     def _pre_fsdp_setup(self, cfg: TrainConfig) -> None:
         """Called after model build, before FSDP. Override to create ref models etc."""
 
+    def _init_expert_parallel(self, cfg: TrainConfig) -> None:
+        """Set up expert-parallel state: split GPUs into two groups, one per MoE expert."""
+        self.expert_parallel = cfg.expert_parallel
+        if not self.expert_parallel:
+            self._effective_train_experts = cfg.train_experts
+            self.expert_group = -1
+            self.dp_rank = self.rank
+            self.dp_size = self.world_size
+            return
+
+        assert cfg.train_experts == "both", (
+            f"expert_parallel requires train_experts='both', got '{cfg.train_experts}'"
+        )
+        assert self.world_size >= 2 and self.world_size % 2 == 0, (
+            f"expert_parallel requires even world_size >= 2, got {self.world_size}"
+        )
+
+        half = self.world_size // 2
+        self.expert_group = 0 if self.rank < half else 1
+        self.dp_rank = self.rank % half
+        self.dp_size = half
+        self._effective_train_experts = "high" if self.expert_group == 0 else "low"
+
+    def _get_expert_parallel_sampler_seed(self, cfg: TrainConfig) -> int:
+        """Sampler seed for expert-parallel mode.
+
+        Default: same seed -> both groups iterate the same data (SFT behavior).
+        Override in subclass for per-group independent data (COS behavior).
+        """
+        return cfg.seed
+
     def _post_init(self, cfg: TrainConfig) -> None:
         """Called after base init, before wandb/resume. Override for MFU etc."""
 
@@ -134,19 +168,21 @@ class BaseTrainer:
     # ------------------------------------------------------------------
 
     def _build_model(self, cfg: TrainConfig) -> WanI2VForTraining:
+        train_experts = self._effective_train_experts
         lora_cfg = (
             LoRATrainConfig(rank=cfg.lora_rank, lora_alpha=cfg.lora_alpha, lora_dropout=cfg.lora_dropout)
             if cfg.lora_rank > 0
             else None
         )
         logger.info(
-            "Loading model from {} (lora_rank={}, experts={}) ...",
-            cfg.model_path, cfg.lora_rank, cfg.train_experts,
+            "Loading model from {} (lora_rank={}, experts={}{}) ...",
+            cfg.model_path, cfg.lora_rank, train_experts,
+            f", expert_group={self.expert_group}" if self.expert_parallel else "",
         )
         model = WanI2VForTraining(
             cfg.model_path,
             lora_config=lora_cfg,
-            train_experts=cfg.train_experts,
+            train_experts=train_experts,
             train_text_encoder=cfg.train_text_encoder,
             gradient_checkpointing=cfg.gradient_checkpointing,
         )
@@ -165,7 +201,20 @@ class BaseTrainer:
     # ------------------------------------------------------------------
 
     def _create_device_mesh(self, cfg: TrainConfig):
-        mesh = init_device_mesh("cuda", (self.world_size,))
+        if self.expert_parallel:
+            mesh_2d = init_device_mesh(
+                "cuda", (2, self.dp_size), mesh_dim_names=("expert", "dp"),
+            )
+            mesh = mesh_2d["dp"]
+            self._dp_pg = mesh.get_group()
+            logger.info(
+                "Expert parallel mesh: group={} dp_rank={}/{}",
+                self.expert_group, self.dp_rank, self.dp_size,
+            )
+        else:
+            mesh = init_device_mesh("cuda", (self.world_size,))
+            self._dp_pg = None
+
         dtype_map = {"bfloat16": torch.bfloat16, "float32": torch.float32}
         mp_policy = MixedPrecisionPolicy(
             param_dtype=dtype_map[cfg.param_dtype],
@@ -241,7 +290,17 @@ class BaseTrainer:
             width=cfg.width,
             fps=cfg.fps,
         )
-        sampler = DistributedSampler(dataset, num_replicas=self.world_size, rank=self.rank, shuffle=True, seed=cfg.seed)
+        if self.expert_parallel:
+            seed = self._get_expert_parallel_sampler_seed(cfg)
+            sampler = DistributedSampler(
+                dataset, num_replicas=self.dp_size, rank=self.dp_rank,
+                shuffle=True, seed=seed,
+            )
+        else:
+            sampler = DistributedSampler(
+                dataset, num_replicas=self.world_size, rank=self.rank,
+                shuffle=True, seed=cfg.seed,
+            )
         return dataset, sampler
 
     def _build_dataloader(self, dataset, cfg: TrainConfig) -> StatefulDataLoader:
@@ -316,7 +375,14 @@ class BaseTrainer:
             return None
         candidates: list[tuple[int, Path]] = []
         for d in output_dir.iterdir():
-            if not d.is_dir() or not (d / ".metadata").exists():
+            if not d.is_dir():
+                continue
+            # Detect checkpoint: direct .metadata (non-EP) or EP subdirectory
+            is_ckpt = (d / ".metadata").exists()
+            if not is_ckpt and self.expert_parallel:
+                expert_name = "high" if self.expert_group == 0 else "low"
+                is_ckpt = (d / expert_name / ".metadata").exists()
+            if not is_ckpt:
                 continue
             name = d.name
             if name.startswith("checkpoint-epoch"):
@@ -342,26 +408,49 @@ class BaseTrainer:
         state: dict = {"train_state": self.train_state}
         if self.ema is not None:
             state["ema"] = self.ema
-        dcp.save(state, checkpoint_id=str(path))
-        torch.save(self.dataloader.state_dict(), path / f"dataloader_rank{self.rank}.pt")
-        if self.rank == 0 and self.model.lora_config is not None:
-            self.model.save_lora(str(path / "lora"))
-        if self.rank == 0:
-            logger.info("Saved DCP checkpoint to {}", path)
+
+        if self.expert_parallel:
+            expert_name = "high" if self.expert_group == 0 else "low"
+            save_path = path / expert_name
+            dcp.save(state, checkpoint_id=str(save_path), process_group=self._dp_pg)
+            torch.save(self.dataloader.state_dict(), save_path / f"dataloader_rank{self.dp_rank}.pt")
+            if self.dp_rank == 0 and self.model.lora_config is not None:
+                self.model.save_lora(str(save_path / "lora"))
+            if self.dp_rank == 0:
+                logger.info("Saved checkpoint to {} (expert={})", save_path, expert_name)
+        else:
+            dcp.save(state, checkpoint_id=str(path))
+            torch.save(self.dataloader.state_dict(), path / f"dataloader_rank{self.rank}.pt")
+            if self.rank == 0 and self.model.lora_config is not None:
+                self.model.save_lora(str(path / "lora"))
+            if self.rank == 0:
+                logger.info("Saved DCP checkpoint to {}", path)
         dist.barrier()
 
     def _load_checkpoint(self, path: str):
-        logger.info("Resuming from {} ...", path)
+        # Resolve path and DCP process group for expert parallel
+        if self.expert_parallel:
+            expert_name = "high" if self.expert_group == 0 else "low"
+            ep_path = Path(path) / expert_name
+            load_path = str(ep_path) if ep_path.exists() else path
+            dl_rank = self.dp_rank
+            dcp_kwargs: dict = {"process_group": self._dp_pg}
+        else:
+            load_path = path
+            dl_rank = self.rank
+            dcp_kwargs = {}
+
+        logger.info("Resuming from {} ...", load_path)
         state: dict = {"train_state": self.train_state}
-        has_legacy_ema = (Path(path) / "ema").is_dir()
+        has_legacy_ema = (Path(load_path) / "ema").is_dir()
         if self.ema is not None and not has_legacy_ema:
             state["ema"] = self.ema
         try:
-            dcp.load(state, checkpoint_id=path)
+            dcp.load(state, checkpoint_id=load_path, **dcp_kwargs)
         except Exception:
             if "ema" in state:
                 logger.warning("Failed to load EMA from DCP, retrying without EMA")
-                dcp.load({"train_state": self.train_state}, checkpoint_id=path)
+                dcp.load({"train_state": self.train_state}, checkpoint_id=load_path, **dcp_kwargs)
             else:
                 raise
         if self.ema is not None and "ema" not in state:
@@ -380,7 +469,7 @@ class BaseTrainer:
             self.total_steps = self._compute_total_steps()
             logger.info("reset_dataloader=True: reset step/epoch/optimizer, total_steps={}", self.total_steps)
         else:
-            dl_state_path = Path(path) / f"dataloader_rank{self.rank}.pt"
+            dl_state_path = Path(load_path) / f"dataloader_rank{dl_rank}.pt"
             if dl_state_path.exists():
                 self.dataloader.load_state_dict(torch.load(dl_state_path, weights_only=False))
                 logger.info("Restored dataloader state from {}", dl_state_path)

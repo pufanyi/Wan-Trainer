@@ -1,6 +1,7 @@
 """DCP (Distributed Checkpoint) state management for FSDP2 training."""
 
 import os
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -82,15 +83,35 @@ class TrainState(Stateful):
             torch.cuda.set_rng_state(state_dict["rng_cuda"])
 
 
+def _detect_checkpoint_layout(checkpoint_path: str) -> dict[str, str]:
+    """Detect checkpoint layout — flat or expert-parallel.
+
+    Returns a mapping from expert name to the DCP directory containing it.
+    Flat:  {"transformer": path, "transformer_2": path}
+    EP:    {"transformer": path/high, "transformer_2": path/low}
+    """
+    p = Path(checkpoint_path)
+    high_dir = p / "high"
+    low_dir = p / "low"
+    if (high_dir / ".metadata").exists() or (low_dir / ".metadata").exists():
+        result = {}
+        if (high_dir / ".metadata").exists():
+            result["transformer"] = str(high_dir)
+        if (low_dir / ".metadata").exists():
+            result["transformer_2"] = str(low_dir)
+        return result
+    return {"transformer": checkpoint_path, "transformer_2": checkpoint_path}
+
+
 def load_dcp_into_pipeline(pipe, checkpoint_path: str, use_ema: bool = False) -> None:
     """Load a DCP training checkpoint into a diffusers pipeline for inference.
 
-    Handles resharding automatically: a checkpoint saved on N GPUs with FSDP2
-    can be loaded on a single GPU for inference.
+    Supports both flat checkpoints and expert-parallel checkpoints (high/ low/ subdirs).
+    Handles resharding automatically.
 
     Args:
         pipe: A WanImageToVideoPipeline (or similar) with .transformer / .transformer_2.
-        checkpoint_path: Path to the DCP checkpoint directory (contains .metadata).
+        checkpoint_path: Path to the DCP checkpoint directory.
         use_ema: If True, load EMA shadow weights instead of model weights.
     """
     needs_cleanup = False
@@ -103,52 +124,41 @@ def load_dcp_into_pipeline(pipe, checkpoint_path: str, use_ema: bool = False) ->
         needs_cleanup = True
 
     try:
-        transformers = {}
-        if getattr(pipe, "transformer", None) is not None:
-            transformers["transformer"] = pipe.transformer
-        if getattr(pipe, "transformer_2", None) is not None:
-            transformers["transformer_2"] = pipe.transformer_2
+        layout = _detect_checkpoint_layout(checkpoint_path)
+        transformers: dict[str, tuple[torch.nn.Module, str]] = {}
+        if getattr(pipe, "transformer", None) is not None and "transformer" in layout:
+            transformers["transformer"] = (pipe.transformer, layout["transformer"])
+        if getattr(pipe, "transformer_2", None) is not None and "transformer_2" in layout:
+            transformers["transformer_2"] = (pipe.transformer_2, layout["transformer_2"])
 
-        if use_ema:
-            _load_ema_into_models(transformers, checkpoint_path)
-        else:
-            _load_train_state_into_models(transformers, checkpoint_path)
+        for name, (model, dcp_path) in transformers.items():
+            if use_ema:
+                _load_ema_single(name, model, dcp_path)
+            else:
+                _load_weights_single(name, model, dcp_path)
     finally:
         if needs_cleanup:
             dist.destroy_process_group()
 
 
-def _load_train_state_into_models(
-    transformers: dict[str, torch.nn.Module],
-    checkpoint_path: str,
-) -> None:
-    """Load model weights from train_state in a DCP checkpoint."""
-    state: dict = {"train_state": {}}
-    for name, model in transformers.items():
-        state["train_state"][name] = model.state_dict()
-
-    dcp.load(state, checkpoint_id=checkpoint_path)
-
-    for name, model in transformers.items():
-        model.load_state_dict(state["train_state"][name])
-    logger.info("Loaded model weights from DCP checkpoint {}", checkpoint_path)
+def _load_weights_single(name: str, model: torch.nn.Module, dcp_path: str) -> None:
+    """Load model weights for a single expert from a DCP checkpoint."""
+    state: dict = {"train_state": {name: model.state_dict()}}
+    dcp.load(state, checkpoint_id=dcp_path)
+    model.load_state_dict(state["train_state"][name])
+    logger.info("Loaded {} weights from {}", name, dcp_path)
 
 
-def _load_ema_into_models(
-    transformers: dict[str, torch.nn.Module],
-    checkpoint_path: str,
-) -> None:
-    """Load EMA shadow weights from a DCP checkpoint into models."""
+def _load_ema_single(name: str, model: torch.nn.Module, dcp_path: str) -> None:
+    """Load EMA shadow weights for a single expert from a DCP checkpoint."""
     shadow: dict[str, torch.Tensor] = {}
-    for model_name, model in transformers.items():
-        for pname, p in model.named_parameters():
-            shadow[f"{model_name}.{pname}"] = torch.empty_like(p, device="cpu")
+    for pname, p in model.named_parameters():
+        shadow[f"{name}.{pname}"] = torch.empty_like(p, device="cpu")
 
     state: dict = {"ema": {"shadow": shadow, "decay": torch.tensor(0.0)}}
-    dcp.load(state, checkpoint_id=checkpoint_path)
+    dcp.load(state, checkpoint_id=dcp_path)
 
-    for model_name, model in transformers.items():
-        prefix = f"{model_name}."
-        sd = {k.removeprefix(prefix): v for k, v in shadow.items() if k.startswith(prefix)}
-        model.load_state_dict(sd)
-    logger.info("Loaded EMA weights from DCP checkpoint {}", checkpoint_path)
+    prefix = f"{name}."
+    sd = {k.removeprefix(prefix): v for k, v in shadow.items() if k.startswith(prefix)}
+    model.load_state_dict(sd)
+    logger.info("Loaded {} EMA weights from {}", name, dcp_path)

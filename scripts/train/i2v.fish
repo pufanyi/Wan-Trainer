@@ -37,4 +37,4 @@ set -l project_root (realpath (dirname (status filename))/../..)
 cd $project_root
 
 echo "Launching training with $nproc GPUs..."
-torchrun --nproc_per_node=$nproc -m src.cli.train_i2v $train_args
+LOGURU_LEVEL=DEBUG torchrun --nproc_per_node=$nproc -m src.cli.train_i2v $train_args

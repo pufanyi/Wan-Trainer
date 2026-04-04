@@ -78,7 +78,13 @@ class TrainConfig(BaseModel):
     grpo_reward_fn: str = "neg_loss"  # reward function name
     grpo_cfg_scale: float = 1.0  # classifier-free guidance scale during sampling
 
-    # COS (Chain-of-Search) piecewise flow matching
+    # COS (Chain-of-Step) piecewise flow matching
     cos_tau_sigma: float = 0.5  # piecewise boundary in sigma space (independent of MoE boundary)
     cos_boundary_noise_std: float = 0.02  # Gaussian perturbation std for x_tau in low stage
     cos_use_standard_formula: bool = False  # ablation: use standard sigma formula per segment (discontinuous)
+
+    # Trainer selection
+    trainer: Literal["i2v", "cos"] = "i2v"  # "cos" for Chain-of-Step piecewise flow matching
+
+    # Expert parallel: split MoE experts across GPU sub-groups
+    expert_parallel: bool = False  # each expert gets world_size/2 GPUs with independent FSDP

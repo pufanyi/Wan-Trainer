@@ -26,10 +26,10 @@ class I2VTrainer(BaseTrainer):
         N = self.model.num_train_timesteps
         experts = []
         if self.model.transformer is not None:
-            prob = bi / N if self.cfg.train_experts == "both" else 1.0
+            prob = bi / N if self._effective_train_experts == "both" else 1.0
             experts.append((prob, self.model.transformer))
         if self.model.transformer_2 is not None:
-            prob = (N - bi) / N if self.cfg.train_experts == "both" else 1.0
+            prob = (N - bi) / N if self._effective_train_experts == "both" else 1.0
             experts.append((prob, self.model.transformer_2))
 
         est_cfg = self.dataset._item_configs[0]

@@ -209,3 +209,5 @@ __marimo__/
 storage/
 
 wandb/
+
+eval_out/

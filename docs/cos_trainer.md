@@ -131,6 +131,7 @@ COS-specific fields (in addition to all standard training fields):
 | `cos_tau_sigma` | `0.5` | Piecewise boundary in sigma space |
 | `cos_boundary_noise_std` | `0.02` | Gaussian perturbation std for `x_tau` in low stage |
 | `cos_use_standard_formula` | `false` | Ablation: use standard sigma formula per segment |
+| `expert_parallel` | `false` | Split MoE experts across GPU sub-groups |
 
 Example config (`configs/train_cos.yaml`):
 
@@ -196,6 +197,65 @@ This has balanced velocity magnitudes by construction but introduces a **discont
 
 Use this for controlled comparison against Solution A.
 
+## Dual Expert Training
+
+By default, `compute_cos_loss` runs **one dedicated forward pass per MoE expert** every step. With `train_experts='both'`, both the high-noise expert (transformer) and low-noise expert (transformer_2) are guaranteed to receive training signal on every step, regardless of the sigma distribution.
+
+Each expert samples sigma only in its own MoE routing range:
+- **transformer**: sigma indices `[0, boundary_idx)` (high-noise, timestep >= 900)
+- **transformer_2**: sigma indices `[boundary_idx, 1000)` (low-noise, timestep < 900)
+
+Within each expert's sigma range, the COS piecewise path is constructed as usual (high stage if sigma >= tau, low stage otherwise).
+
+## Expert Parallel Mode
+
+Setting `expert_parallel: true` splits the GPU fleet into two groups, each training one expert independently:
+
+```yaml
+expert_parallel: true
+train_experts: both  # required
+```
+
+```
+Node 0: GPU 0,1,2,3 → high-noise expert (transformer)
+Node 1: GPU 4,5,6,7 → low-noise expert (transformer_2)
+```
+
+### Benefits
+
+- **Memory**: Each GPU only holds shards of one expert (half the trainable parameters)
+- **Communication**: FSDP gradient sync within group only (4 GPUs instead of 8)
+- **Throughput**: Each group iterates the dataset independently, doubling data diversity
+
+### Data strategy
+
+| Mode | Data per group | Implementation |
+|------|---------------|----------------|
+| COS | **Different** items | Different sampler seed per group |
+| SFT | **Same** items | Same sampler seed (default) |
+
+For COS, each group independently iterates through the dataset with a per-group seed. For SFT (I2VTrainer), both groups see the same items (matching dp_rank positions get identical indices).
+
+### GPU placement
+
+For optimal communication, place each expert group's GPUs on the **same node**. With `torchrun`, ranks are assigned contiguously per node by default, so the first half of GPUs (one node) becomes group 0 and the second half becomes group 1.
+
+For multi-node setups with 8 GPUs per node:
+- 2 nodes (16 GPUs): group 0 on node 0 (ranks 0-7), group 1 on node 1 (ranks 8-15)
+- 4 nodes (32 GPUs): group 0 on nodes 0-1 (ranks 0-15), group 1 on nodes 2-3 (ranks 16-31)
+
+### Checkpointing
+
+In expert parallel mode, each group saves independently to subdirectories:
+
+```
+checkpoint-100/
+  high/    # DCP shards from group 0
+  low/     # DCP shards from group 1
+```
+
+Resume detects the subdirectory structure automatically. Loading a non-EP checkpoint into an EP setup also works (each group loads the relevant expert).
+
 ## Architecture
 
 ```
@@ -205,10 +265,11 @@ src/
 ├── data/
 │   └── i2v_dataset.py            # Dataset (loads search_video when present)
 ├── models/
-│   └── wan_i2v.py                # compute_cos_loss() method
+│   └── wan_i2v.py                # compute_cos_loss() — per-expert dedicated sigma
 └── trainer/
-    ├── config.py                  # cos_tau_sigma, cos_boundary_noise_std, cos_use_standard_formula
-    └── cos_trainer.py             # COSTrainer class with per-stage debug logging
+    ├── base_trainer.py            # Expert parallel: sub-mesh FSDP, sampler hooks
+    ├── config.py                  # cos_*, expert_parallel
+    └── cos_trainer.py             # COSTrainer with dual expert + EP sampler override
 ```
 
 No changes to the model backbone, VAE, text encoder, MoE routing, or ODE solver.
@@ -221,3 +282,4 @@ No changes to the model backbone, VAE, text encoder, MoE routing, or ODE solver.
 | Generated video jumps directly to final, skipping search | Search video too similar to final | Make search video visually distinct |
 | Blurry boundary region during inference | Boundary handoff instability | Increase `cos_boundary_noise_std` slightly (e.g., 0.05) |
 | ODE solver diverges | Step size too large for curved path | Increase inference steps (50-100) |
+| Expert parallel: groups desync | Different dataset sizes or filtering | Use same dataset for both groups |

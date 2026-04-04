@@ -6,8 +6,11 @@ that teaches the model to first develop a coarse search-like structure
 (high-noise stage) and then refine it into the final execution video
 (low-noise stage).
 
-The MoE routing boundary is kept unchanged; the piecewise semantic
-boundary (cos_tau_sigma) is independent and defaults to 0.5.
+Each available MoE expert gets a dedicated sigma sample every step,
+guaranteeing both experts are always trained (when train_experts='both').
+
+Expert parallel mode (expert_parallel=True) splits GPU groups so each
+group only loads and trains one expert, with independent data iteration.
 """
 
 import time
@@ -25,7 +28,6 @@ from src.trainer.utils import cosine_lr, format_eta, to_model_pixels
 class COSTrainer(BaseTrainer):
     def _post_init(self, cfg: TrainConfig) -> None:
         self.mfu_monitor = self._setup_mfu()
-        # Running averages for per-stage debug logging
         self._cos_debug_accum: dict[str, float] = {}
         self._cos_debug_count: int = 0
 
@@ -39,10 +41,10 @@ class COSTrainer(BaseTrainer):
         N = self.model.num_train_timesteps
         experts = []
         if self.model.transformer is not None:
-            prob = bi / N if self.cfg.train_experts == "both" else 1.0
+            prob = bi / N if self._effective_train_experts == "both" else 1.0
             experts.append((prob, self.model.transformer))
         if self.model.transformer_2 is not None:
-            prob = (N - bi) / N if self.cfg.train_experts == "both" else 1.0
+            prob = (N - bi) / N if self._effective_train_experts == "both" else 1.0
             experts.append((prob, self.model.transformer_2))
 
         est_cfg = self.dataset._item_configs[0]
@@ -70,8 +72,12 @@ class COSTrainer(BaseTrainer):
             )
             weighted_fwd_flops += prob * fwd
 
-        # COS encodes 2 videos per step (2x VAE encode) but transformer cost dominates
-        flops_per_step = 3 * weighted_fwd_flops * self.cfg.batch_size * self.cfg.gradient_accumulation_steps
+        # With dual expert: 2 forward passes per step (one per expert)
+        n_expert_passes = len(experts)
+        flops_per_step = (
+            3 * weighted_fwd_flops * n_expert_passes
+            * self.cfg.batch_size * self.cfg.gradient_accumulation_steps
+        )
 
         logger.info(
             "MFU monitor: seq_len={}, forward={:.2e} FLOPs/sample, step={:.2e} FLOPs, GPU={} ({:.0f} TFLOPS bf16)",
@@ -95,8 +101,8 @@ class COSTrainer(BaseTrainer):
         train_start_step = global_step
 
         logger.info(
-            "COS training: tau_sigma={}, boundary_noise_std={}, use_standard_formula={}",
-            cfg.cos_tau_sigma, cfg.cos_boundary_noise_std, cfg.cos_use_standard_formula,
+            "COS training: tau_sigma={}, boundary_noise_std={}, expert_parallel={}",
+            cfg.cos_tau_sigma, cfg.cos_boundary_noise_std, cfg.expert_parallel,
         )
 
         for epoch in range(start_epoch, cfg.num_epochs):
@@ -111,7 +117,6 @@ class COSTrainer(BaseTrainer):
                 scaled_loss = loss / cfg.gradient_accumulation_steps
                 scaled_loss.backward()
 
-                # Accumulate debug stats
                 for k, v in debug.items():
                     self._cos_debug_accum[k] = self._cos_debug_accum.get(k, 0.0) + v
                 self._cos_debug_count += 1
@@ -146,23 +151,27 @@ class COSTrainer(BaseTrainer):
                             eta_str = "?"
                             it_s_str = "?"
 
-                        # Average debug stats over accumulation window
                         cnt = max(self._cos_debug_count, 1)
-                        avg_debug = {k: v / cnt for k, v in self._cos_debug_accum.items()}
+                        avg = {k: v / cnt for k, v in self._cos_debug_accum.items()}
 
                         logger.info(
                             "step={}/{} epoch={} loss={:.4f} lr={:.2e} grad_norm={:.4f} mfu={} eta={} ({} it/s)",
                             global_step, self.total_steps, epoch,
                             loss.item(), lr, self._last_grad_norm, mfu_str, eta_str, it_s_str,
                         )
-                        logger.info(
-                            "  COS: n_high={:.0f} n_low={:.0f} tnorm_high={:.2f} tnorm_low={:.2f} "
-                            "sigma=[{:.3f}, {:.3f}] mean={:.3f}",
-                            avg_debug.get("n_high", 0), avg_debug.get("n_low", 0),
-                            avg_debug.get("target_norm_high", 0), avg_debug.get("target_norm_low", 0),
-                            avg_debug.get("sigma_min", 0), avg_debug.get("sigma_max", 0),
-                            avg_debug.get("sigma_mean", 0),
-                        )
+
+                        # Per-expert debug lines
+                        for en in ["high", "low"]:
+                            lk = f"loss_{en}"
+                            if lk in avg:
+                                logger.info(
+                                    "  expert={}: loss={:.4f} tnorm={:.2f} sigma={:.3f} cos_h={:.0f} cos_l={:.0f}",
+                                    en, avg[lk],
+                                    avg.get(f"target_norm_{en}", 0),
+                                    avg.get(f"sigma_mean_{en}", 0),
+                                    avg.get(f"n_cos_high_{en}", 0),
+                                    avg.get(f"n_cos_low_{en}", 0),
+                                )
 
                         if self.use_wandb:
                             import wandb
@@ -172,12 +181,13 @@ class COSTrainer(BaseTrainer):
                                 "train/lr": lr,
                                 "train/epoch": epoch,
                                 "train/grad_norm": self._last_grad_norm,
-                                "cos/n_high": avg_debug.get("n_high", 0),
-                                "cos/n_low": avg_debug.get("n_low", 0),
-                                "cos/target_norm_high": avg_debug.get("target_norm_high", 0),
-                                "cos/target_norm_low": avg_debug.get("target_norm_low", 0),
-                                "cos/sigma_mean": avg_debug.get("sigma_mean", 0),
                             }
+                            for en in ["high", "low"]:
+                                lk = f"loss_{en}"
+                                if lk in avg:
+                                    log_metrics[f"cos/loss_{en}"] = avg[lk]
+                                    log_metrics[f"cos/target_norm_{en}"] = avg.get(f"target_norm_{en}", 0)
+                                    log_metrics[f"cos/sigma_mean_{en}"] = avg.get(f"sigma_mean_{en}", 0)
                             if mfu is not None:
                                 log_metrics["train/mfu"] = mfu
                             wandb.log(log_metrics, step=global_step)
@@ -207,6 +217,12 @@ class COSTrainer(BaseTrainer):
     def _train_step(self, batch: dict) -> tuple[torch.Tensor, dict[str, float]]:
         """Single forward pass: encode frozen inputs, compute COS piecewise loss."""
         cfg = self.cfg
+
+        # indices = batch["index"].tolist()
+        # for i, idx in enumerate(indices):
+        #     item = self.dataset.data[idx]
+        #     print(f"  sample[{i}] idx={idx} video={item.get('video', '?')} search_video={item.get('search_video', '?')}", flush=True)
+
         prompt_embeds = self.model.encode_text(batch["prompt"], self.device)
         video = to_model_pixels(batch["video"], self.device)
         image = to_model_pixels(batch["image"], self.device)
@@ -214,7 +230,6 @@ class COSTrainer(BaseTrainer):
         x_final = self.model.encode_video(video)
         condition = self.model.prepare_condition(image, video.shape[2], video.shape[-2], video.shape[-1])
 
-        # Encode search video
         search_video = to_model_pixels(batch["search_video"], self.device)
         x_tau = self.model.encode_video(search_video)
 
