@@ -13,6 +13,8 @@ import ftfy
 import regex as re
 import torch
 import torch.nn.functional as F
+
+from src.models.cos_path import PathType, compute_cos_path
 from diffusers import AutoencoderKLWan
 from diffusers.models import WanTransformer3DModel
 from loguru import logger
@@ -405,6 +407,8 @@ class WanI2VForTraining:
         tau_sigma: float = 0.5,
         boundary_noise_std: float = 0.02,
         use_standard_formula: bool = False,
+        path_type: PathType = "linear",
+        smooth_blend_delta: float = 0.05,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Compute piecewise flow-matching loss for COS training.
 
@@ -444,40 +448,32 @@ class WanI2VForTraining:
 
             noise = torch.randn_like(x_final)
 
-            # COS piecewise path: sigma vs tau determines which stage
-            cos_high = sigmas >= tau_sigma
-            cos_low = ~cos_high
-
-            x_t = torch.zeros_like(x_final)
-            target = torch.zeros_like(x_final)
-
-            # ---- COS high stage: noise -> x_tau ----
-            if cos_high.any():
-                z_h = noise[cos_high]
-                x_tau_h = x_tau[cos_high]
-                sigma_h = sigmas_5d[cos_high]
-                if use_standard_formula:
+            if use_standard_formula:
+                # Ablation: raw sigma per segment (discontinuous at boundary)
+                cos_high = sigmas >= tau_sigma
+                cos_low = ~cos_high
+                x_t = torch.zeros_like(x_final)
+                target = torch.zeros_like(x_final)
+                if cos_high.any():
+                    z_h = noise[cos_high]
+                    x_tau_h = x_tau[cos_high]
+                    sigma_h = sigmas_5d[cos_high]
                     x_t[cos_high] = sigma_h * z_h + (1.0 - sigma_h) * x_tau_h
                     target[cos_high] = z_h - x_tau_h
-                else:
-                    s_h = (sigma_h - tau_sigma) / (1.0 - tau_sigma)
-                    x_t[cos_high] = s_h * z_h + (1.0 - s_h) * x_tau_h
-                    target[cos_high] = (z_h - x_tau_h) / (1.0 - tau_sigma)
-
-            # ---- COS low stage: x_tau -> x_final ----
-            if cos_low.any():
-                x_tau_l = x_tau[cos_low]
-                x_final_l = x_final[cos_low]
-                sigma_l = sigmas_5d[cos_low]
-                if boundary_noise_std > 0:
-                    x_tau_l = x_tau_l + torch.randn_like(x_tau_l) * boundary_noise_std
-                if use_standard_formula:
+                if cos_low.any():
+                    x_tau_l = x_tau[cos_low]
+                    x_final_l = x_final[cos_low]
+                    sigma_l = sigmas_5d[cos_low]
+                    if boundary_noise_std > 0:
+                        x_tau_l = x_tau_l + torch.randn_like(x_tau_l) * boundary_noise_std
                     x_t[cos_low] = sigma_l * x_tau_l + (1.0 - sigma_l) * x_final_l
                     target[cos_low] = x_tau_l - x_final_l
-                else:
-                    s_l = sigma_l / tau_sigma
-                    x_t[cos_low] = s_l * x_tau_l + (1.0 - s_l) * x_final_l
-                    target[cos_low] = (x_tau_l - x_final_l) / tau_sigma
+            else:
+                x_t, target = compute_cos_path(
+                    path_type, sigmas_5d, tau_sigma, noise, x_tau, x_final,
+                    boundary_noise_std=boundary_noise_std,
+                    smooth_blend_delta=smooth_blend_delta,
+                )
 
             # Forward through this expert (no MoE routing needed — sigma is in range)
             model_input = torch.cat([x_t, condition], dim=1)
@@ -500,11 +496,12 @@ class WanI2VForTraining:
                 def _norm(t: torch.Tensor) -> float:
                     return t.float().reshape(t.shape[0], -1).norm(dim=1).mean().item()
 
+                cos_high = sigmas >= tau_sigma
                 debug[f"loss_{expert_name}"] = expert_loss.item()
                 debug[f"target_norm_{expert_name}"] = _norm(target) if B > 0 else 0.0
                 debug[f"sigma_mean_{expert_name}"] = sigmas.mean().item()
                 debug[f"n_cos_high_{expert_name}"] = cos_high.sum().item()
-                debug[f"n_cos_low_{expert_name}"] = cos_low.sum().item()
+                debug[f"n_cos_low_{expert_name}"] = (~cos_high).sum().item()
 
         final_loss = total_loss / n_experts if n_experts > 0 else total_loss
         debug["n_experts"] = n_experts

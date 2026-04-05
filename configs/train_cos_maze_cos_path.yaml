@@ -1,7 +1,7 @@
 trainer: cos
 model_path: storage/models/Wan2.2-I2V-A14B-Diffusers
 dataset_json: /mnt/umm/users/pufanyi/workspace/maze/data/train_cos.json
-output_dir: storage/checkpoints/cos_maze_2
+output_dir: storage/checkpoints/cos_maze_cos_path
 
 num_frames: 81
 height: 256
@@ -20,8 +20,9 @@ log_steps: 1
 seed: 42
 
 # COS piecewise flow matching
-cos_tau_sigma: 0.9
+cos_tau_sigma: 0.3
 cos_boundary_noise_std: 0.02
+cos_path_type: target_cosine
 
 ema_decay: 0.99
 

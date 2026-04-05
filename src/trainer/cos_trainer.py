@@ -275,4 +275,6 @@ class COSTrainer(BaseTrainer):
             tau_sigma=cfg.cos_tau_sigma,
             boundary_noise_std=cfg.cos_boundary_noise_std,
             use_standard_formula=cfg.cos_use_standard_formula,
+            path_type=cfg.cos_path_type,
+            smooth_blend_delta=cfg.cos_smooth_blend_delta,
         )

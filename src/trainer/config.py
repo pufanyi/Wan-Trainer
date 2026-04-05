@@ -82,6 +82,8 @@ class TrainConfig(BaseModel):
     cos_tau_sigma: float = 0.5  # piecewise boundary in sigma space (independent of MoE boundary)
     cos_boundary_noise_std: float = 0.02  # Gaussian perturbation std for x_tau in low stage
     cos_use_standard_formula: bool = False  # ablation: use standard sigma formula per segment (discontinuous)
+    cos_path_type: Literal["linear", "cosine", "cubic_hermite", "smooth_blend", "quadratic_bezier", "target_linear", "target_cosine"] = "linear"
+    cos_smooth_blend_delta: float = 0.05  # half-width of blending window (only for smooth_blend path)
 
     # Trainer selection
     trainer: Literal["i2v", "cos"] = "i2v"  # "cos" for Chain-of-Step piecewise flow matching
