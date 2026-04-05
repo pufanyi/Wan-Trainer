@@ -9,8 +9,25 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from diffusers import WanImageToVideoPipeline
+from diffusers import (
+    DDIMScheduler,
+    DPMSolverMultistepScheduler,
+    EulerAncestralDiscreteScheduler,
+    EulerDiscreteScheduler,
+    FlowMatchEulerDiscreteScheduler,
+    UniPCMultistepScheduler,
+    WanImageToVideoPipeline,
+)
 from diffusers.utils import export_to_video, load_image
+
+SCHEDULERS = {
+    "euler": EulerDiscreteScheduler,
+    "euler_ancestral": EulerAncestralDiscreteScheduler,
+    "ddim": DDIMScheduler,
+    "dpm_solver": DPMSolverMultistepScheduler,
+    "unipc": UniPCMultistepScheduler,
+    "flow_match_euler": FlowMatchEulerDiscreteScheduler,
+}
 
 
 def parse_args():
@@ -48,6 +65,13 @@ def parse_args():
         help="Path to a DCP training checkpoint directory to load (overrides transformer weights)",
     )
     parser.add_argument("--use_ema", action="store_true", help="Load EMA shadow weights from DCP checkpoint")
+    parser.add_argument(
+        "--scheduler",
+        type=str,
+        default=None,
+        choices=list(SCHEDULERS.keys()),
+        help="Override the default scheduler/solver (default: use model's original scheduler)",
+    )
     return parser.parse_args()
 
 
@@ -65,6 +89,11 @@ def main():
 
         print(f"Loading DCP checkpoint from {args.checkpoint} (ema={args.use_ema}) ...")
         load_dcp_into_pipeline(pipe, args.checkpoint, use_ema=args.use_ema)
+
+    if args.scheduler:
+        scheduler_cls = SCHEDULERS[args.scheduler]
+        pipe.scheduler = scheduler_cls.from_config(pipe.scheduler.config)
+        print(f"Using scheduler: {scheduler_cls.__name__}")
 
     pipe.to(device)
 

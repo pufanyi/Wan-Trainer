@@ -34,9 +34,26 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from diffusers import WanImageToVideoPipeline
+from diffusers import (
+    DDIMScheduler,
+    DPMSolverMultistepScheduler,
+    EulerAncestralDiscreteScheduler,
+    EulerDiscreteScheduler,
+    FlowMatchEulerDiscreteScheduler,
+    UniPCMultistepScheduler,
+    WanImageToVideoPipeline,
+)
 from diffusers.utils import export_to_video
 from PIL import Image
+
+SCHEDULERS = {
+    "euler": FlowMatchEulerDiscreteScheduler,
+    "euler_ancestral": EulerAncestralDiscreteScheduler,
+    "ddim": DDIMScheduler,
+    "dpm_solver": DPMSolverMultistepScheduler,
+    "unipc": UniPCMultistepScheduler,
+    "flow_match_euler": FlowMatchEulerDiscreteScheduler,
+}
 
 
 def parse_args():
@@ -49,7 +66,14 @@ def parse_args():
         help="Path to the model directory",
     )
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save results")
-    parser.add_argument("--checkpoint", type=str, default=None, help="Path to a DCP training checkpoint")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Path(s) to DCP training checkpoint(s). When multiple are given, "
+        "the base model is loaded once and each checkpoint is evaluated in turn.",
+    )
     parser.add_argument("--use_ema", action="store_true", help="Load EMA shadow weights from checkpoint")
     parser.add_argument(
         "--negative_prompt",
@@ -75,6 +99,13 @@ def parse_args():
     )
     parser.add_argument(
         "--copy_refs", action="store_true", help="Copy first_frame and solution image into output"
+    )
+    parser.add_argument(
+        "--scheduler",
+        type=str,
+        default=None,
+        choices=list(SCHEDULERS.keys()),
+        help="Override the default scheduler/solver (default: use model's original scheduler)",
     )
     return parser.parse_args()
 
@@ -105,48 +136,19 @@ def decode_latents_to_frames(pipe, latents: torch.Tensor) -> list:
     return frames[0]  # list of PIL images for batch element 0
 
 
-def main():
-    args = parse_args()
-
-    # ---- Distributed setup ----
-    if "RANK" in os.environ:
-        dist.init_process_group("nccl")
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-    else:
-        rank = 0
-        world_size = 1
-
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    device = torch.device(f"cuda:{local_rank}")
-    torch.cuda.set_device(device)
-
-    # ---- Load eval data ----
-    eval_json = Path(args.eval_json)
-    base_dir = eval_json.parent
-    data = json.loads(eval_json.read_text())
-
-    my_indices = list(range(rank, len(data), world_size))
-    if rank == 0:
-        print(f"Eval: {len(data)} samples, {world_size} GPUs, {len(my_indices)} samples/rank")
-        print(f"Steps: {args.num_inference_steps}, Resolution: {args.width}x{args.height}, Frames: {args.num_frames}")
-
-    # ---- Load pipeline ----
-    if rank == 0:
-        print(f"Loading model from {args.model_path} ...")
-    pipe = WanImageToVideoPipeline.from_pretrained(args.model_path, torch_dtype=torch.bfloat16)
-
-    if args.checkpoint:
-        from src.trainer.checkpoint import load_dcp_into_pipeline
-
-        if rank == 0:
-            print(f"Loading DCP checkpoint from {args.checkpoint} (ema={args.use_ema}) ...")
-        load_dcp_into_pipeline(pipe, args.checkpoint, use_ema=args.use_ema)
-
-    pipe.to(device)
+def _run_eval(
+    pipe,
+    args,
+    data: list[dict],
+    my_indices: list[int],
+    output_dir: Path,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+):
+    """Run evaluation for one checkpoint configuration (already loaded into pipe)."""
 
     # ---- Output dir ----
-    output_dir = Path(args.output_dir)
     if rank == 0:
         output_dir.mkdir(parents=True, exist_ok=True)
     if world_size > 1:
@@ -154,31 +156,28 @@ def main():
     else:
         output_dir.mkdir(parents=True, exist_ok=True)
 
+    base_dir = Path(args.eval_json).parent
+
     # ---- Compute which steps to render ----
     total_steps = args.num_inference_steps
     if args.num_render_steps is not None and args.num_render_steps < total_steps:
         n = args.num_render_steps
-        # Evenly spaced indices, always including first (0) and last (total_steps-1)
         render_indices = {round(i * (total_steps - 1) / (n - 1)) for i in range(n)} if n > 1 else {total_steps - 1}
     else:
-        render_indices = None  # render all
+        render_indices = None
 
     if rank == 0 and render_indices is not None:
         print(f"Rendering {len(render_indices)} of {total_steps} steps: {sorted(render_indices)}")
 
     # ---- Monkey-patch scheduler to capture z0 predictions ----
-    # In Flow Matching / Rectified Flow the model predicts velocity v.
-    # The predicted clean latent is: z0 = z_t - sigma * v
-    # With per-token timesteps (Wan I2V expand_timesteps), sigma varies per token.
     z0_predictions: dict[int, torch.Tensor] = {}
     scheduler = pipe.scheduler
     original_step = scheduler.step
-    _step_counter = [0]  # mutable counter for closure
+    _step_counter = [0]
 
     def patched_step(model_output, timestep, sample, **kwargs):
         step_idx = _step_counter[0]
         if render_indices is None or step_idx in render_indices:
-            # Ensure step_index is initialised (it's None before the first call)
             if scheduler.step_index is None:
                 scheduler._init_step_index(timestep)
             sigma = scheduler.sigmas[scheduler.step_index]
@@ -197,7 +196,6 @@ def main():
         name = f"{idx:06d}"
         sample_dir = output_dir / name
 
-        # Skip if last step video already exists
         last_step_path = sample_dir / f"step_{args.num_inference_steps - 1:02d}.mp4"
         if last_step_path.exists():
             print(f"[rank {rank}] Skipping {name} (exists)")
@@ -205,7 +203,6 @@ def main():
 
         sample_dir.mkdir(parents=True, exist_ok=True)
 
-        # Load first frame image
         first_frame_field = item.get("first_frame") or item.get("image")
         if not first_frame_field:
             print(f"[rank {rank}] Skipping {name}: no first_frame or image")
@@ -213,7 +210,6 @@ def main():
         img_path = _resolve_path(first_frame_field, base_dir)
         image = Image.open(str(img_path)).convert("RGB").resize((args.width, args.height))
 
-        # Optionally copy reference images
         if args.copy_refs:
             shutil.copy2(str(img_path), str(sample_dir / "first_frame.png"))
             sol_field = item.get("image")
@@ -221,7 +217,6 @@ def main():
                 sol_path = _resolve_path(sol_field, base_dir)
                 shutil.copy2(str(sol_path), str(sample_dir / "solution.png"))
 
-        # Clear z0 buffer and reset step counter
         z0_predictions.clear()
         _step_counter[0] = 0
 
@@ -235,16 +230,14 @@ def main():
             guidance_scale=args.guidance_scale,
             num_inference_steps=args.num_inference_steps,
             generator=generator,
-            output_type="latent",  # skip pipeline's own VAE decode
+            output_type="latent",
         )
 
-        # Decode z0 predictions and save each step's video
         for step_idx in sorted(z0_predictions.keys()):
             step_path = sample_dir / f"step_{step_idx:02d}.mp4"
             frames = decode_latents_to_frames(pipe, z0_predictions[step_idx])
             export_to_video(frames, str(step_path), fps=args.fps)
 
-        # Optionally save raw latents (only rendered steps)
         if args.save_latents:
             latent_path = sample_dir / "latents.pt"
             ordered = [z0_predictions[k] for k in sorted(z0_predictions.keys())]
@@ -255,15 +248,90 @@ def main():
             f"Saved {name} ({len(z0_predictions)} step videos)"
         )
 
-        # Free memory
         z0_predictions.clear()
+
+    # Restore original scheduler step
+    pipe.scheduler.step = original_step
+
+    if rank == 0:
+        print(f"Done checkpoint eval. Results in {output_dir}")
+
+
+def main():
+    args = parse_args()
+
+    # ---- Distributed setup ----
+    if "RANK" in os.environ:
+        dist.init_process_group("nccl")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+    else:
+        rank = 0
+        world_size = 1
+
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(device)
+
+    # ---- Load eval data ----
+    eval_json = Path(args.eval_json)
+    data = json.loads(eval_json.read_text())
+
+    my_indices = list(range(rank, len(data), world_size))
+    if rank == 0:
+        print(f"Eval: {len(data)} samples, {world_size} GPUs, {len(my_indices)} samples/rank")
+        print(f"Steps: {args.num_inference_steps}, Resolution: {args.width}x{args.height}, Frames: {args.num_frames}")
+
+    # ---- Load pipeline (once) ----
+    if rank == 0:
+        print(f"Loading model from {args.model_path} ...")
+    pipe = WanImageToVideoPipeline.from_pretrained(args.model_path, torch_dtype=torch.bfloat16)
+
+    if args.scheduler:
+        scheduler_cls = SCHEDULERS[args.scheduler]
+        pipe.scheduler = scheduler_cls.from_config(pipe.scheduler.config)
+        if rank == 0:
+            print(f"Using scheduler: {scheduler_cls.__name__}")
+
+    pipe.to(device)
+
+    # ---- Build checkpoint list ----
+    checkpoints = args.checkpoint or [None]  # None = base model without DCP
+
+    for ckpt_idx, checkpoint in enumerate(checkpoints):
+        # Derive per-checkpoint output dir
+        if len(checkpoints) > 1 and checkpoint is not None:
+            ckpt_name = checkpoint.rstrip("/").replace("/", "_")
+            # Strip common prefix for cleaner names
+            if "storage/checkpoints/" in ckpt_name:
+                ckpt_name = ckpt_name.split("storage_checkpoints_", 1)[-1]
+            ema_suffix = "_ema" if args.use_ema else ""
+            output_dir = Path(args.output_dir) / f"{ckpt_name}{ema_suffix}"
+        else:
+            output_dir = Path(args.output_dir)
+
+        if checkpoint is not None:
+            from src.trainer.checkpoint import load_dcp_into_pipeline
+
+            if rank == 0:
+                print(
+                    f"\n{'='*60}\n"
+                    f"[{ckpt_idx + 1}/{len(checkpoints)}] Loading DCP: {checkpoint} (ema={args.use_ema})\n"
+                    f"Output: {output_dir}\n"
+                    f"{'='*60}"
+                )
+            load_dcp_into_pipeline(pipe, checkpoint, use_ema=args.use_ema)
+        elif rank == 0:
+            print(f"Evaluating base model (no checkpoint)")
+
+        _run_eval(pipe, args, data, my_indices, output_dir, rank, world_size, device)
 
     if world_size > 1:
         dist.barrier()
         dist.destroy_process_group()
 
     if rank == 0:
-        print(f"Done. Results in {output_dir}")
+        print(f"\nAll done. Evaluated {len(checkpoints)} checkpoint(s).")
 
 
 if __name__ == "__main__":
