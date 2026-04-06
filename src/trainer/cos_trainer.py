@@ -188,9 +188,10 @@ class COSTrainer(BaseTrainer):
                             avg.update(self._remote_expert_avg)
                             del self._remote_expert_avg
 
+                        fractional_epoch = epoch + (batch_idx + 1) / len(self.dataloader)
                         logger.info(
-                            "step={}/{} epoch={} loss={:.4f} lr={:.2e} grad_norm={:.4f} mfu={} eta={} ({} s/it)",
-                            global_step, self.total_steps, epoch,
+                            "step={}/{} epoch={:.2f} loss={:.4f} lr={:.2e} grad_norm={:.4f} mfu={} eta={} ({} s/it)",
+                            global_step, self.total_steps, fractional_epoch,
                             loss.item(), lr, self._last_grad_norm, mfu_str, eta_str, s_it_str,
                         )
 
@@ -213,7 +214,7 @@ class COSTrainer(BaseTrainer):
                             log_metrics = {
                                 "train/loss": loss.item(),
                                 "train/lr": lr,
-                                "train/epoch": epoch,
+                                "train/epoch": fractional_epoch,
                                 "train/grad_norm": self._last_grad_norm,
                             }
                             for en in ["high", "low"]:

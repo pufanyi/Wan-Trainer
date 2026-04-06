@@ -382,10 +382,11 @@ class GRPOTrainer(BaseTrainer):
                     else:
                         eta_str, speed_str = "?", "?"
 
+                    fractional_epoch = epoch + (batch_idx + 1) / len(self.dataloader)
                     logger.info(
-                        "step={}/{} epoch={} policy_loss={:.4f} kl_loss={:.4f} reward={:.4f}+/-{:.4f} "
+                        "step={}/{} epoch={:.2f} policy_loss={:.4f} kl_loss={:.4f} reward={:.4f}+/-{:.4f} "
                         "lr={:.2e} grad_norm={:.4f} eta={} ({} s/it)",
-                        global_step, self.total_steps, epoch,
+                        global_step, self.total_steps, fractional_epoch,
                         metrics["policy_loss"], metrics["kl_loss"],
                         metrics["reward_mean"], metrics["reward_std"],
                         lr, grad_norm, eta_str, speed_str,
@@ -401,7 +402,7 @@ class GRPOTrainer(BaseTrainer):
                             "grpo/advantage_mean": metrics["advantage_mean"],
                             "train/lr": lr,
                             "train/grad_norm": grad_norm,
-                            "train/epoch": epoch,
+                            "train/epoch": fractional_epoch,
                         }, step=global_step)
 
                 if cfg.save_steps > 0 and global_step % cfg.save_steps == 0:

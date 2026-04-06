@@ -9,8 +9,9 @@
 
 # ── Configuration ────────────────────────────────────────────────────
 set CHECKPOINTS \
-    storage/checkpoints/cos_maze_cos_path/checkpoint-2000 \
-    storage/checkpoints/cos_maze_linear_path/checkpoint-2000
+    storage/checkpoints/sft_maze/checkpoint-epoch0
+    # storage/checkpoints/cos_maze_cos_path/checkpoint-2000 \
+    # storage/checkpoints/cos_maze_linear_path/checkpoint-2000
     # storage/checkpoints/cos_maze/checkpoint-epoch0
     # storage/checkpoints/cos_maze/checkpoint-3000
     # storage/checkpoints/cos_maze/checkpoint-4000
