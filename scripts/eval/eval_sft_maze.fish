@@ -9,30 +9,30 @@
 
 # ── Configuration ────────────────────────────────────────────────────
 set CHECKPOINTS \
-    storage/checkpoints/cos_maze_cos_path/checkpoint-4000
-    # storage/checkpoints/sft_maze/checkpoint-epoch0
+    storage/checkpoints/cos_maze_cos_path/checkpoint-4000 \
+    storage/checkpoints/sft_maze/checkpoint-epoch0
     # storage/checkpoints/cos_maze_linear_path/checkpoint-2000
     # storage/checkpoints/cos_maze/checkpoint-epoch0
     # storage/checkpoints/cos_maze/checkpoint-3000
     # storage/checkpoints/cos_maze/checkpoint-4000
 set NUM_GPUS 1
-set NUM_SAMPLES 1         # leave empty to use all samples
+set NUM_SAMPLES 5         # leave empty to use all samples
 set NUM_RENDER_STEPS     # leave empty to render all steps
 set SCHEDULER           # leave empty for default; options: euler, euler_ancestral, ddim, dpm_solver, unipc, flow_match_euler
-set EVAL_JSON /mnt/umm/users/pufanyi/workspace/maze/data/train_sft.json
+set EVAL_JSON /mnt/umm/users/pufanyi/workspace/maze/test_data_easy/test.json
 # ─────────────────────────────────────────────────────────────────────
 
 # Derive output dir: single checkpoint gets a specific name, multiple uses a generic base
 if test (count $CHECKPOINTS) -eq 1
     set -l CKPT_NAME (string replace -a / _ (string trim -r -c / $CHECKPOINTS[1] | string replace -r '.*storage/checkpoints/' ''))
-    set OUTPUT_DIR eval_out/{$CKPT_NAME}_ema
+    set OUTPUT_DIR storage/eval_out/{$CKPT_NAME}_ema
 else
-    set OUTPUT_DIR eval_out/multi_ckpt
+    set OUTPUT_DIR storage/eval_out/multi_ckpt
 end
 
 # If NUM_SAMPLES is set, create a trimmed json and adjust output dir
 if test -n "$NUM_SAMPLES"
-    set TRIMMED_JSON /mnt/umm/users/pufanyi/workspace/maze/data/eval_maze_first_{$NUM_SAMPLES}.json
+    set TRIMMED_JSON /mnt/umm/users/pufanyi/workspace/maze/test_data_easy/eval_maze_first_{$NUM_SAMPLES}.json
     uv run python -c "
 import json, sys
 data = json.load(open('$EVAL_JSON'))
