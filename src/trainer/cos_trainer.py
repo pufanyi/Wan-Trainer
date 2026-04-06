@@ -162,7 +162,7 @@ class COSTrainer(BaseTrainer):
                             buf = torch.zeros(len(_ep_keys), device=self.device)
                             dist.recv(buf, src=half)
                             self._remote_expert_avg = {
-                                f"{k}_low": v for k, v in zip(_ep_keys, buf.tolist())
+                                f"{k}_low": v for k, v in zip(_ep_keys, buf.tolist(), strict=True)
                             }
 
                     if self.rank == 0 and global_step % cfg.log_steps == 0:
@@ -255,7 +255,8 @@ class COSTrainer(BaseTrainer):
         # indices = batch["index"].tolist()
         # for i, idx in enumerate(indices):
         #     item = self.dataset.data[idx]
-        #     print(f"  sample[{i}] idx={idx} video={item.get('video', '?')} search_video={item.get('search_video', '?')}", flush=True)
+        #     sv = item.get('search_video', '?')
+        #     print(f"  sample[{i}] idx={idx} video={item.get('video', '?')} search_video={sv}", flush=True)
 
         prompt_embeds = self.model.encode_text(batch["prompt"], self.device)
         video = to_model_pixels(batch["video"], self.device)

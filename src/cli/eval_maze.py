@@ -38,7 +38,6 @@ from diffusers import (
     DDIMScheduler,
     DPMSolverMultistepScheduler,
     EulerAncestralDiscreteScheduler,
-    EulerDiscreteScheduler,
     FlowMatchEulerDiscreteScheduler,
     UniPCMultistepScheduler,
     WanImageToVideoPipeline,
@@ -322,7 +321,7 @@ def main():
                 )
             load_dcp_into_pipeline(pipe, checkpoint, use_ema=args.use_ema)
         elif rank == 0:
-            print(f"Evaluating base model (no checkpoint)")
+            print("Evaluating base model (no checkpoint)")
 
         _run_eval(pipe, args, data, my_indices, output_dir, rank, world_size, device)
 

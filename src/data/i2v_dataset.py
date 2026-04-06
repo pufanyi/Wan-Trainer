@@ -242,7 +242,9 @@ class I2VDataset(Dataset):
         raw_image = item.get("image")
         if isinstance(raw_image, list):
             raw_image = raw_image[0] if raw_image else None
-        image = self._load_image(self._resolve(raw_image, base_dir), height, width) if raw_image else video[:, 0].clone()
+        image = (
+            self._load_image(self._resolve(raw_image, base_dir), height, width) if raw_image else video[:, 0].clone()
+        )
 
         result = {
             "index": idx,

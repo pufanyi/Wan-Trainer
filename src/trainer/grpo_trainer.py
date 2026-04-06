@@ -57,7 +57,7 @@ class GRPOTrainer(BaseTrainer):
     def _setup_fsdp(self, cfg: TrainConfig) -> list[torch.nn.Module]:
         sync_modules = super()._setup_fsdp(cfg)
         # Also shard frozen reference transformers
-        for name, ref in self.ref_transformers.items():
+        for _name, ref in self.ref_transformers.items():
             shard_transformer(ref, self.mesh, self.mp_policy)
         return sync_modules
 

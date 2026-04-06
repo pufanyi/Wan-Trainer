@@ -1,7 +1,6 @@
 """Base trainer with shared infrastructure for FSDP2 + DCP training."""
 
 import os
-import time
 from pathlib import Path
 
 import torch
@@ -18,7 +17,7 @@ from src.models.wan_i2v import LoRATrainConfig, WanI2VForTraining
 from src.trainer.checkpoint import TrainState
 from src.trainer.config import TrainConfig
 from src.trainer.ema import EMA
-from src.trainer.utils import apply_liger_rms_norm, collate, cosine_lr, setup_loguru, shard_transformer
+from src.trainer.utils import apply_liger_rms_norm, collate, setup_loguru, shard_transformer
 
 
 class BaseTrainer:

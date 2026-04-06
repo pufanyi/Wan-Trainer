@@ -73,11 +73,7 @@ def target_quadratic(sigma: np.ndarray, tau: float, noise: float, v1: float, v2:
     # alpha(0)=0, alpha(1)=1, alpha(tau)=0.5
     # a*tau^2 + (1-a)*tau = 0.5  =>  a = (0.5 - tau) / (tau^2 - tau)
     denom = tau * tau - tau
-    if abs(denom) < 1e-10:
-        # tau = 0.5 => a = 0, linear alpha
-        a = 0.0
-    else:
-        a = (0.5 - tau) / denom
+    a = 0.0 if abs(denom) < 1e-10 else (0.5 - tau) / denom
 
     alpha = a * sigma**2 + (1 - a) * sigma
     dalpha = 2 * a * sigma + (1 - a)
@@ -111,7 +107,7 @@ def main():
 
     # --- Plot 1: trajectory x_t(sigma) ---
     ax = axes[0]
-    for (name, fn), c in zip(methods, colors):
+    for (name, fn), c in zip(methods, colors, strict=False):
         x_t, _, _ = fn(sigma, tau, noise, v1, v2)
         ax.plot(sigma, x_t, label=name, color=c, linewidth=2)
     ax.axvline(tau, color="gray", linestyle="--", alpha=0.5, label=f"τ={tau}")
@@ -125,7 +121,7 @@ def main():
 
     # --- Plot 2: alpha(sigma) ---
     ax = axes[1]
-    for (name, fn), c in zip(methods, colors):
+    for (name, fn), c in zip(methods, colors, strict=False):
         _, _, alpha = fn(sigma, tau, noise, v1, v2)
         ax.plot(sigma, alpha, label=name, color=c, linewidth=2)
     ax.axvline(tau, color="gray", linestyle="--", alpha=0.5, label=f"τ={tau}")
@@ -138,7 +134,7 @@ def main():
 
     # --- Plot 3: velocity ---
     ax = axes[2]
-    for (name, fn), c in zip(methods, colors):
+    for (name, fn), c in zip(methods, colors, strict=False):
         _, vel, _ = fn(sigma, tau, noise, v1, v2)
         ax.plot(sigma, vel, label=name, color=c, linewidth=2)
     ax.axvline(tau, color="gray", linestyle="--", alpha=0.5, label=f"τ={tau}")

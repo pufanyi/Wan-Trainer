@@ -12,7 +12,7 @@ def apply_liger_rms_norm(model: torch.nn.Module) -> int:
     from liger_kernel.transformers import LigerRMSNorm
 
     count = 0
-    for parent_name, parent in list(model.named_modules()):
+    for _parent_name, parent in list(model.named_modules()):
         for name, module in list(parent.named_children()):
             if not isinstance(module, torch.nn.RMSNorm):
                 continue

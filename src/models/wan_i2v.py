@@ -13,14 +13,14 @@ import ftfy
 import regex as re
 import torch
 import torch.nn.functional as F
-
-from src.models.cos_path import PathType, compute_cos_path
 from diffusers import AutoencoderKLWan
 from diffusers.models import WanTransformer3DModel
 from loguru import logger
 from peft import LoraConfig
 from pydantic import BaseModel
 from transformers import AutoTokenizer, UMT5EncoderModel
+
+from src.models.cos_path import PathType, compute_cos_path
 
 
 class LoRATrainConfig(BaseModel):

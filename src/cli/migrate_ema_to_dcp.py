@@ -56,7 +56,7 @@ def migrate_checkpoint(
             ckpt_path,
         )
         return
-    for (_, shadow), loaded in zip(pairs, legacy_shadows):
+    for (_, shadow), loaded in zip(pairs, legacy_shadows, strict=True):
         shadow.copy_(loaded)
     logger.info("Loaded {} legacy EMA shadows from {}", len(legacy_shadows), ema_file)
 
